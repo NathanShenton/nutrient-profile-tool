@@ -42,9 +42,9 @@ div.stButton>button:hover,div.stDownloadButton>button:hover { background:#28644d
 """, unsafe_allow_html=True)
 
 st.markdown("""
-<div class="hero"><div class="eyebrow">Product nourishment · considered with care</div>
-<h1>Nutrition, thoughtfully.</h1>
-<p>A calm, transparent workspace for nutrition scoring and product evidence. Explore both NPM models, understand every point, and keep specialist judgement at the centre.</p></div>
+<div class="hero"><div class="eyebrow">Nutrition product assessment</div>
+<h1>Nutrition Product Tool</h1>
+<p>Calculate NPM scores, review the inputs and record product evidence.</p></div>
 """, unsafe_allow_html=True)
 
 NPM = {
