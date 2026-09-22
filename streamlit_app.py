@@ -16,7 +16,7 @@ import pandas as pd
 import streamlit as st
 
 
-st.set_page_config(page_title="Nutrition, thoughtfully", page_icon="🌿", layout="wide")
+st.set_page_config(page_title="Nutrition Profile Tool", page_icon="🌿", layout="wide")
 CATEGORY_FILE = Path(__file__).with_name("dwh_odl_dim_categories_fpna.csv")
 CATEGORY_COLUMNS = [
     "category_fpna_l1_name", "category_fpna_l2_name",
