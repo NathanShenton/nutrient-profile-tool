@@ -18,7 +18,7 @@ import pandas as pd
 import streamlit as st
 
 
-st.set_page_config(page_title="Nutrient Profile Tool", page_icon="🌿", layout="wide")
+st.set_page_config(page_title="Nutrition, thoughtfully", page_icon="🌿", layout="wide")
 CATEGORY_FILE = Path(__file__).with_name("dwh_odl_dim_categories_fpna.csv")
 CATEGORY_COLUMNS = [
     "category_fpna_l1_name", "category_fpna_l2_name",
@@ -76,9 +76,9 @@ NPM = {
     "2018": dict(id="NPM 2018", label="NPM 2018 · scenario / future-readiness", a=[("Energy (kJ)","energy",[315,630,945,1260,1575,1890,2205,2520,2835,3150]),("Saturated fat (g)","sat",[.9,1.9,2.8,3.7,4.7,5.6,6.6,7.5,8.4,9.4]),("Free sugars (g)","freeSugar",[.9,1.9,2.8,3.7,4.6,5.6,6.5,7.4,8.3,9.3]),("Salt (g)","salt",[.2,.5,.7,.9,1.1,1.4,1.6,1.8,2,2.3])], fibre={"AOAC":[.6,1.2,1.8,2.4,3,3.6,4.2,4.8,5.4,6]}, protein=[1.7,3.4,5.1,6.8,8.5], fv="fvns")
 }
 
-# Transcribed current H&B threshold reference from the supplied prototype.
+# Internal threshold reference transcribed from the supplied prototype.
 # These are comparisons against entered values, not a governed compliance decision.
-HB_THRESHOLDS = {
+INTERNAL_THRESHOLDS = {
     "Banana and plantain chips": [("sugar", "<=", 15), ("sat", "<=", 19)],
     "Bread substitutes": [("sat", "<=", 2.8), ("fibre", ">=", 3), ("salt", "<=", 1.2)],
     "Breakfast cereals": [("sugar", "<=", 16), ("sat", "<=", 2.8), ("fibre", ">=", 6), ("salt", "<=", .9)],
@@ -108,7 +108,7 @@ HB_THRESHOLDS = {
     "Warm tomato / vegetable sauces": [("salt", "<=", 1.1)],
     "Chocolate": [("sugar", "<=", 30)],
 }
-HB_METRIC_LABELS = {"sugar":"Total sugars", "sat":"Saturated fat", "salt":"Salt", "fibre":"Fibre", "protein":"Protein", "plantPoints":"Plant points", "proteinEnergyPct":"Energy from protein"}
+INTERNAL_METRIC_LABELS = {"sugar":"Total sugars", "sat":"Saturated fat", "salt":"Salt", "fibre":"Fibre", "protein":"Protein", "plantPoints":"Plant points", "proteinEnergyPct":"Energy from protein"}
 INGREDIENT_REVIEW_PROMPTS = [
     ("Benzoates", ["benzoate", "benzoic acid"]),
     ("Nitrites and nitrates", ["nitrite", "nitrate"]),
@@ -126,7 +126,7 @@ BULK_TEMPLATE_COLUMNS = [
     "salt_g", "protein_g", "fibre_g", "fibre_method", "free_sugars_g",
     "fvn_percent", "fvns_percent", "nutrition_source", "specialist_source",
     "reviewer", "review_decision", "review_notes", "added_sugar_status",
-    "hb_threshold_category", "plant_points", "protein_energy_percent",
+    "internal_threshold_category", "plant_points", "protein_energy_percent",
 ]
 
 
@@ -192,8 +192,8 @@ def bulk_row_to_record(row: dict, index: int, run_timestamp: str, default_review
             values[target]=None; warnings.append(f"{source}: outside the accepted range ({text})"); continue
         values[target]=int(value) if target=="plantPoints" else value
     x={**values,"salt":values["salt"],"sodium":values["salt"]*400 if values["salt"] is not None else None,"fibreMethod":fibre_method}
-    threshold_category=cell("hb_threshold_category")
-    if threshold_category not in HB_THRESHOLDS:
+    threshold_category=cell("internal_threshold_category")
+    if threshold_category not in INTERNAL_THRESHOLDS:
         threshold_category=""
     reviewer=cell("reviewer") or default_reviewer
     inputs={"sku":sku,"name":name,"product_type":kind,"assessment_basis":basis,
@@ -206,16 +206,16 @@ def bulk_row_to_record(row: dict, index: int, run_timestamp: str, default_review
     record={"timestamp":run_timestamp,"rulesetBuild":"2026-09-10 v0.1","runType":"bulk user calculation",
         "inputs":inputs,"results":results,"inputWarnings":warnings,
         "ingredientPromptMatches":scan_ingredient_review(inputs["ingredients"]),
-        "hbThresholdCheck":{"category":threshold_category,"rows":check_hb_thresholds(threshold_category,x,added) if threshold_category else []}}
+        "internalThresholdCheck":{"category":threshold_category,"rows":check_internal_thresholds(threshold_category,x,added) if threshold_category else []}}
     filename=f"{safe_filename_part(sku,'SKU')} - {safe_filename_part(name,'Product')}.pdf"
     return record,filename
 
 
-def check_hb_thresholds(category: str, x: dict, added_sugar: str) -> list[dict]:
+def check_internal_thresholds(category: str, x: dict, added_sugar: str) -> list[dict]:
     values={"sugar":x.get("sugar"),"sat":x.get("sat"),"salt":x.get("salt"),"fibre":x.get("fibre"),"protein":x.get("protein"),"plantPoints":x.get("plantPoints"),"proteinEnergyPct":x.get("proteinEnergyPct")}
     rows=[]
-    for key,operator,target in HB_THRESHOLDS[category]:
-        label="Added-sugar status" if key=="addedSugarStatus" else HB_METRIC_LABELS[key]
+    for key,operator,target in INTERNAL_THRESHOLDS[category]:
+        label="Added-sugar status" if key=="addedSugarStatus" else INTERNAL_METRIC_LABELS[key]
         if key=="addedSugarStatus":
             status="PENDING" if added_sugar=="Unknown — review needed" else ("PASS" if added_sugar=="Confirmed no added sugar" else "FAIL")
             observed=added_sugar
@@ -363,21 +363,21 @@ def build_assessment_pdf(record: dict) -> bytes:
     else:
         story.append(para("No prototype keyword prompts found. This does not confirm policy compliance.","BodySmall"))
     story.append(para("Keyword matching only; check the ingredient and its function against the current controlled policy.","MutedSmall"))
-    story.append(Paragraph("H&B internal threshold comparison",styles["Section"]))
-    hb=record.get("hbThresholdCheck") or {}
-    if not hb.get("category"):
-        story.append(para("No H&B threshold category was selected; compliance was not assessed.","BodySmall"))
+    story.append(Paragraph("Internal threshold comparison",styles["Section"]))
+    internal_check=record.get("internalThresholdCheck") or {}
+    if not internal_check.get("category"):
+        story.append(para("No internal threshold category was selected; comparison was not assessed.","BodySmall"))
     else:
-        story.append(para(f"Selected reference category: {hb['category']}. Status compares entered values with the threshold transcription; it is not a governed compliance decision.","MutedSmall"))
-        hb_rows=hb.get("rows",[])
-        if hb_rows:
+        story.append(para(f"Selected reference category: {internal_check['category']}. Status compares entered values with the threshold transcription; it is not a governed compliance decision.","MutedSmall"))
+        threshold_rows=internal_check.get("rows",[])
+        if threshold_rows:
             table_rows=[[para(x,"TableHead") for x in ["NUTRIENT / CRITERION","ENTERED VALUE","THRESHOLD","STATUS"]]]
-            for item in hb_rows:
+            for item in threshold_rows:
                 table_rows.append([para(item.get("Nutrient / criterion")),para(item.get("Entered value")),para(item.get("Threshold")),para(item.get("Status"))])
             story.append(grid(table_rows,[48*mm,45*mm,40*mm,32*mm]))
         else:
             story.append(para("Threshold category could not be evaluated.","BodySmall"))
-        story.append(para("Confirm category mapping, units and limits against the current controlled H&B policy before using this comparison.","MutedSmall"))
+        story.append(para("Confirm category mapping, units and limits against the current controlled internal policy before using this comparison.","MutedSmall"))
     warnings=record.get("inputWarnings",[])
     if warnings:
         story.append(Paragraph("Bulk input warnings",styles["Section"]))
@@ -410,14 +410,14 @@ def build_assessment_pdf(record: dict) -> bytes:
 with st.sidebar:
     st.markdown("### Your assessment")
     st.caption("One product at a time · values per 100 g or 100 ml")
-    sku=st.text_input("SKU ID",placeholder="e.g. HB-10482")
+    sku=st.text_input("SKU ID",placeholder="e.g. SKU-10482")
     name=st.text_input("Product name",placeholder="e.g. Berry oat bar")
     kind=st.selectbox("Product type",["Food","Drink"])
     basis=st.selectbox("Assessment basis",["As sold","Reconstituted to pack instructions"])
     st.markdown("---")
     st.caption("Reference values only. Reconstituted products should use values after preparation as directed.")
 
-assessment, bulk, scope, policy, audit, guide = st.tabs(["✦  Product assessment","Bulk upload","✧  Category estimate","❋  H&B thresholds","Calculation logic & audit","Guide & controls"])
+assessment, bulk, scope, policy, audit, guide = st.tabs(["✦  Product assessment","Bulk upload","✧  Category estimate","❋  Nutrition thresholds","Calculation logic & audit","Guide & controls"])
 with assessment:
     st.markdown("## A clearer picture of your product")
     st.markdown('<div class="muted">Use verified supplier or laboratory data. Specialist values should come from an approved source.</div>',unsafe_allow_html=True)
@@ -453,7 +453,7 @@ with assessment:
             st.markdown("### Specialist values & evidence")
             c1,c2=st.columns(2)
             with c1: fvn=st.number_input("FVN · % (2004/05)",min_value=0.0,max_value=100.0,value=None,step=.1,placeholder="Verified value"); fvns=st.number_input("FVNS · % (2018)",min_value=0.0,max_value=100.0,value=None,step=.1,placeholder="Verified value")
-            with c2: plant=st.number_input("Plant points · H&B policy input",min_value=0,value=None,step=1); protein_pct=st.number_input("Energy from protein · %",min_value=0.0,max_value=100.0,value=None,step=.1)
+            with c2: plant=st.number_input("Plant points · internal policy input",min_value=0,value=None,step=1); protein_pct=st.number_input("Energy from protein · %",min_value=0.0,max_value=100.0,value=None,step=.1)
             st.markdown('<div class="amber-note">FVN, FVNS and free sugars must not be inferred from an ingredient list alone. Missing verified values block the relevant model.</div>',unsafe_allow_html=True)
             calc=st.button("Calculate both NPM models",type="primary",use_container_width=True)
             example=st.button("Load worked 2004/05 example")
@@ -489,30 +489,30 @@ with assessment:
             for r in results:
                 st.markdown(f"**{NPM[r['model']]['id']}**")
                 if not r["blocked"]: st.dataframe(pd.DataFrame(r["ledger"]),hide_index=True,use_container_width=True)
-        st.markdown("### H&B threshold check")
+        st.markdown("### Internal threshold check")
         st.caption("Choose a product category to compare its entered nutrient values with the reference thresholds.")
-        hb_category=st.selectbox("H&B threshold category",list(HB_THRESHOLDS),key="hb_threshold_category")
-        run_hb_check=st.button("Check selected threshold",key="run_hb_check",use_container_width=True)
-        hb_inputs={**x,"addedSugarStatus":added}
-        if run_hb_check:
-            st.session_state["hb_check_result"]={"category":hb_category,"inputs":hb_inputs,"rows":check_hb_thresholds(hb_category,x,added)}
-        saved_hb=st.session_state.get("hb_check_result")
-        if saved_hb:
-            if saved_hb["category"]!=hb_category or saved_hb["inputs"]!=hb_inputs:
+        internal_category=st.selectbox("Internal threshold category",list(INTERNAL_THRESHOLDS),key="internal_threshold_category")
+        run_internal_check=st.button("Check selected threshold",key="run_internal_check",use_container_width=True)
+        threshold_inputs={**x,"addedSugarStatus":added}
+        if run_internal_check:
+            st.session_state["internal_check_result"]={"category":internal_category,"inputs":threshold_inputs,"rows":check_internal_thresholds(internal_category,x,added)}
+        saved_internal=st.session_state.get("internal_check_result")
+        if saved_internal:
+            if saved_internal["category"]!=internal_category or saved_internal["inputs"]!=threshold_inputs:
                 st.info("Product values or category have changed since the last check. Run the check again.")
             else:
-                failed=[row["Nutrient / criterion"] for row in saved_hb["rows"] if row["Status"]=="FAIL"]
-                pending=[row["Nutrient / criterion"] for row in saved_hb["rows"] if row["Status"]=="PENDING"]
+                failed=[row["Nutrient / criterion"] for row in saved_internal["rows"] if row["Status"]=="FAIL"]
+                pending=[row["Nutrient / criterion"] for row in saved_internal["rows"] if row["Status"]=="PENDING"]
                 if failed: st.error("Outside selected threshold: " + ", ".join(failed))
                 elif pending: st.warning("Check incomplete. Add or confirm: " + ", ".join(pending))
                 else: st.success("All checked criteria are within the selected thresholds.")
-                st.dataframe(pd.DataFrame(saved_hb["rows"]),hide_index=True,use_container_width=True)
-                st.caption("Reference comparison only; confirm thresholds against the current controlled H&B policy before making a product decision.")
+                st.dataframe(pd.DataFrame(saved_internal["rows"]),hide_index=True,use_container_width=True)
+                st.caption("Reference comparison only; confirm thresholds against the current controlled internal policy before making a product decision.")
         if results:
             run_inputs=run["inputs"]
             record={"timestamp":run["timestamp"],"rulesetBuild":"2026-09-10 v0.1","runType":run["source"],"inputs":run_inputs,"results":results,
                     "ingredientPromptMatches":scan_ingredient_review(run_inputs.get("ingredients","")),
-                    "hbThresholdCheck":{"category":hb_category,"rows":check_hb_thresholds(hb_category,run_inputs,run_inputs.get("addedSugarStatus","Unknown — review needed"))},"inputWarnings":[]}
+                    "internalThresholdCheck":{"category":internal_category,"rows":check_internal_thresholds(internal_category,run_inputs,run_inputs.get("addedSugarStatus","Unknown — review needed"))},"inputWarnings":[]}
             prompt_matches=record["ingredientPromptMatches"]
             with st.expander(f"Ingredient review prompts · {len(prompt_matches)} match(es)",expanded=bool(prompt_matches)):
                 if prompt_matches:
@@ -542,9 +542,9 @@ with bulk:
     st.caption("Upload up to 10 products. The tool calculates both NPM models and creates one PDF per SKU.")
     template = pd.DataFrame(columns=BULK_TEMPLATE_COLUMNS).to_csv(index=False).encode("utf-8")
     st.download_button("Download CSV template",template,file_name="npm_bulk_input_template.csv",mime="text/csv",key="bulk_template_download")
-    st.markdown("Fill one row per SKU. Enter nutrient values per 100 g or 100 ml. Use `Food` or `Drink` for product_type. The H&B threshold category must match a category listed in the H&B thresholds tab. Leave unknown numeric values blank; the report will show when a model cannot be calculated.")
-    with st.expander("Valid H&B threshold categories"):
-        st.write(", ".join(HB_THRESHOLDS.keys()))
+    st.markdown("Fill one row per SKU. Enter nutrient values per 100 g or 100 ml. Use `Food` or `Drink` for product_type. The internal threshold category must match a category listed in the Nutrition thresholds tab. Leave unknown numeric values blank; the report will show when a model cannot be calculated.")
+    with st.expander("Valid internal threshold categories"):
+        st.write(", ".join(INTERNAL_THRESHOLDS.keys()))
     bulk_reviewer=st.text_input("Default user / reviewer",key="bulk_default_reviewer")
     if st.session_state.get("bulk_pdf_outputs") and st.session_state.get("bulk_reviewer_for_outputs")!=bulk_reviewer:
         st.session_state.pop("bulk_pdf_outputs",None)
@@ -562,7 +562,7 @@ with bulk:
             bulk_df.columns=[str(col).strip().lower() for col in bulk_df.columns]
             if bulk_df.columns.duplicated().any():
                 bulk_errors.append("The CSV has duplicate column names after trimming spaces and converting to lowercase.")
-            missing_headers=sorted(set(BULK_TEMPLATE_COLUMNS[:3]+["hb_threshold_category"])-set(bulk_df.columns))
+            missing_headers=sorted(set(BULK_TEMPLATE_COLUMNS[:3]+["internal_threshold_category"])-set(bulk_df.columns))
             if missing_headers:
                 bulk_errors.append("Missing required columns: "+", ".join(missing_headers))
             if len(bulk_df)>10:
@@ -575,16 +575,16 @@ with bulk:
                     sku_value=str(row.get("sku_id","")).strip()
                     name_value=str(row.get("sku_name","")).strip()
                     kind_value=str(row.get("product_type","")).strip().casefold()
-                    category_value=str(row.get("hb_threshold_category","")).strip()
+                    category_value=str(row.get("internal_threshold_category","")).strip()
                     if not sku_value: bulk_errors.append(f"Row {row_num}: SKU ID is required.")
                     if not name_value: bulk_errors.append(f"Row {row_num}: SKU name is required.")
                     if kind_value not in {"food","drink","beverage"}:
                         bulk_errors.append(f"Row {row_num}: product_type must be Food or Drink.")
-                    category_key=next((category for category in HB_THRESHOLDS if category.casefold()==category_value.casefold()),None)
+                    category_key=next((category for category in INTERNAL_THRESHOLDS if category.casefold()==category_value.casefold()),None)
                     if not category_key:
-                        bulk_errors.append(f"Row {row_num}: choose an H&B threshold category from the valid category list.")
+                        bulk_errors.append(f"Row {row_num}: choose an internal threshold category from the valid category list.")
                     else:
-                        bulk_df.at[row_index,"hb_threshold_category"]=category_key
+                        bulk_df.at[row_index,"internal_threshold_category"]=category_key
                 if "sku_id" in bulk_df:
                     sku_values=bulk_df["sku_id"].astype(str).str.strip()
                     duplicated=sku_values[sku_values.ne("") & sku_values.duplicated(keep=False)]
@@ -676,8 +676,8 @@ with scope:
         st.markdown("**Evidence**"); st.write(res.get("evidence_rationale",[])); st.markdown("**Alternative categories considered**"); st.write(res.get("alternative_categories",[])); st.markdown("**Missing information**"); st.write(res.get("missing_information",[])); st.caption(res.get("limitations","Human review required."))
 
 with policy:
-    st.markdown("## Holland & Barrett nutrition references")
-    st.markdown('<div class="amber-note"><b>Reference only.</b> Transcribed from the source prototype’s H&B threshold table. The source notes unresolved units, category mapping and interpretation. These values do not feed the NPM calculations and are not approved pass/fail criteria.</div>',unsafe_allow_html=True)
+    st.markdown("## Nutrition references")
+    st.markdown('<div class="amber-note"><b>Reference only.</b> Transcribed from a supplied threshold table. The source notes unresolved units, category mapping and interpretation. These values do not feed the NPM calculations and are not approved pass/fail criteria.</div>',unsafe_allow_html=True)
     global_policy={"Banana and plantain chips":"Total sugars ≤15 g; saturated fat ≤19 g","Bread substitutes":"Saturated fat ≤2.8 g; fibre ≥3 g; salt ≤1.2 g","Breakfast cereals":"Total sugars ≤16 g; saturated fat ≤2.8 g; fibre ≥6 g; salt ≤0.9 g","Broths":"Salt ≤0.59 g","Brown bread":"Fibre >10 g; salt ≤1.08 g","Cakes":"Total sugars ≤15 g; saturated fat ≤11 g; salt ≤0.66 g","Chewing gum and mints":"No added sugar","Chips / crisps":"Saturated fat ≤3 g; salt ≤1.1 g","Chocolate spread":"Total sugars ≤15 g; saturated fat ≤9 g","Cold tomato / vegetable sauces":"Total sugars ≤16 g; salt ≤1.63 g","Cookies":"Total sugars ≤18 g; saturated fat ≤11 g; salt ≤0.76 g","Dairy and plant-based drinks":"Total sugars ≤4.5 g","Emulsion-based sauces":"Salt ≤1 g","Fruit and vegetable juices":"No added sugar","Grain, muesli, fruit and energy bars":"Total sugars ≤20 g; saturated fat ≤5 g; salt ≤0.4 g","Hot beverages":"Total sugars ≤4.5 g","Meat substitutes":"Saturated fat ≤18.1 g; salt ≤1.3 g","Nut-based spreads":"Total sugars ≤10 g; saturated fat ≤6 g; salt ≤0.84 g","Other savoury snacks":"Saturated fat ≤2.5 g; salt ≤1.5 g","Other savoury spreads":"Saturated fat ≤2.5 g; salt ≤1.1 g","Protein bar":"Total sugars ≤20 g; saturated fat ≤5 g; fibre ≥6 g; salt ≤0.8 g","Salted nuts and seeds":"Salt ≤1.2 g","Soft drinks, energy drinks and prepared syrups":"Total sugars ≤4.5 g","Soups":"Salt ≤0.59 g","Sweet spreads":"Total sugars ≤27 g","Sweets":"Total sugars ≤15 g","Warm tomato / vegetable sauces":"Salt ≤1.1 g","Chocolate":"Total sugars ≤30 g"}
     aspirational={"Breakfast cereals":"Protein energy ≥12%; fibre ≥6 g; plant points ≥5","Cakes":"Fibre >6 g; plant points >4","Chips":"Fibre >6 g; plant points >1","Chocolate":"Fibre ≥10 g; plant points ≥2","Cookies":"Fibre ≥6 g; protein ≥8 g; plant points ≥5","Grain, muesli, fruit and energy bars":"Fibre ≥6 g; protein ≥8 g; plant points ≥5","Nut-based spreads":"Fibre ≥6 g; protein ≥10 g; plant points ≥3","Protein bar":"Protein ≥20 g; fibre ≥8 g; plant points ≥4","Soft drinks, energy drinks and prepared syrups":"Plant points ≥1","Soups":"Fibre ≥3 g; protein ≥3 g; plant points ≥5","Sweet spreads":"Fibre ≥6 g; protein ≥10 g; plant points ≥5","Warm tomato / vegetable sauces":"Plant points ≥3","Brown bread":"Fibre >10 g; plant points >5","Salted nuts and seeds":"Plant points ≥5","Other savoury spreads":"Fibre ≥6 g; plant points ≥3","Other savoury snacks":"Plant points ≥3"}
     st.markdown("### Current nutrition thresholds · reference"); st.dataframe(pd.DataFrame([{"Product family":k,"Thresholds per 100":v} for k,v in global_policy.items()]),hide_index=True,use_container_width=True)
@@ -747,7 +747,7 @@ with guide:
     st.markdown("### Ingredient review prompts")
     st.caption("A lightweight keyword prompt only. It does not determine compliance or replace the controlled additive policy.")
     st.dataframe(pd.DataFrame([{"Review area":label,"Terms scanned":", ".join(terms)} for label,terms in INGREDIENT_REVIEW_PROMPTS]),hide_index=True,use_container_width=True)
-    st.caption("The scan is case-insensitive. BHA and BHT are matched as whole words. This list we can tweak in the codebase if needed")
+    st.caption("The scan is case-insensitive. BHA and BHT are matched as whole words. To change what it checks, edit `INGREDIENT_REVIEW_PROMPTS` in app.py; the table, single and bulk runs use the same list.")
     ingredient_text=st.text_area("Ingredient declaration to review",value=ingredients,key="ingredient_screen",height=110)
     if st.button("Scan for review prompts"):
         matches=scan_ingredient_review(ingredient_text)
