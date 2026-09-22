@@ -439,7 +439,7 @@ with assessment:
                     l3=st.selectbox("L3 category",[""]+l3_options,key="category_l3",disabled=not bool(l2),format_func=lambda v:v or ("Select L3 category" if l2 else "Select L2 first"),on_change=_clear_category_children,args=(3,))
                     l4_options=sorted(CATEGORY_TREE.loc[CATEGORY_TREE[CATEGORY_COLUMNS[2]].eq(l3)&CATEGORY_TREE[CATEGORY_COLUMNS[1]].eq(l2)&CATEGORY_TREE[CATEGORY_COLUMNS[0]].eq(l1),CATEGORY_COLUMNS[3]].loc[lambda s:s.ne("")].unique().tolist()) if l3 else []
                     l4=st.selectbox("L4 category",[""]+l4_options,key="category_l4",disabled=not bool(l3),format_func=lambda v:v or ("Select L4 category" if l3 else "Select L3 first"))
-            with c2: reviewer=st.text_input("User / reviewer"); decision=st.selectbox("Reviewer decision",["Not reviewed","Accepted","Accepted with caveat","Overridden"]); nutrition_source=st.text_input("Nutrition source"); specialist_source=st.text_input("Specialist data source")
+            with c2: reviewer=st.text_input("User / reviewer"); decision=st.selectbox("Reviewer decision",["Not reviewed","Accepted","Accepted with caveat","Overridden"]); nutrition_source=st.text_input("Nutrition source"); specialist_source=st.text_input("Data source (for free sugar)")
             ingredients=st.text_area("Ingredient declaration",height=110,placeholder="Paste the legal ingredient declaration. Text is stored as evidence; it is not used to infer NPM inputs.")
             review_notes=st.text_area("Review rationale / caveat",height=70)
         with st.container(border=True):
