@@ -1,4 +1,4 @@
-"""Nutrition product assessment — Streamlit edition.
+"""Nutrient Profile Tool — Streamlit edition.
 
 Run with: streamlit run app.py
 Calculations are a transparent working aid and do not replace expert or regulatory sign-off.
@@ -65,7 +65,7 @@ div.stButton>button:hover,div.stDownloadButton>button:hover { background:#28644d
 """, unsafe_allow_html=True)
 
 st.markdown("""
-<div class="hero"><div class="eyebrow">Nutrition product assessment</div>
+<div class="hero"><div class="eyebrow">Nutrition Assessment</div>
 <h1>Nutrition Product Tool</h1>
 <p>Calculate NPM scores, review the inputs and record product evidence.</p></div>
 """, unsafe_allow_html=True)
@@ -719,7 +719,7 @@ with audit:
                     c_rows=[row for row in result["ledger"] if row["Group"]=="C"]
                     fv_row=next(row for row in c_rows if row["Input"].startswith("FVN"))
                     fibre_row=next(row for row in c_rows if row["Input"].startswith("Fibre"))
-                    protein_row=next(row for row in c_rows if row["Input"]=="Protein")
+                    protein_row=next(row for row in c_rows if row["Input"].startswith("Protein"))
                     st.markdown(f"**Step 1 - A points:** {' + '.join(str(row['Points']) for row in a_rows)} = **{result['A']}**")
                     st.dataframe(pd.DataFrame(a_rows),hide_index=True,use_container_width=True)
                     st.markdown(f"**Step 2 - C points:** FVN/FVNS {fv_row['Points']} + fibre {fibre_row['Points']} + protein {protein_row['Points'] if result['protein_used'] else 0} = **{result['C']}**")
