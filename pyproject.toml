@@ -2,7 +2,7 @@
 name = "nutrition-product-tool"
 version = "0.1.0"
 description = "Nutrition product assessment Streamlit app"
-requires-python = ">=3.10,<3.14"
+requires-python = ">=3.10,<3.15"
 dependencies = [
     "streamlit",
     "pandas",
