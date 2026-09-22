@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import json
 import re
+from io import BytesIO
 from datetime import datetime, timezone
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 import pandas as pd
 import streamlit as st
@@ -72,6 +74,63 @@ NPM = {
     "2018": dict(id="NPM 2018", label="NPM 2018 · scenario / future-readiness", a=[("Energy (kJ)","energy",[315,630,945,1260,1575,1890,2205,2520,2835,3150]),("Saturated fat (g)","sat",[.9,1.9,2.8,3.7,4.7,5.6,6.6,7.5,8.4,9.4]),("Free sugars (g)","freeSugar",[.9,1.9,2.8,3.7,4.6,5.6,6.5,7.4,8.3,9.3]),("Salt (g)","salt",[.2,.5,.7,.9,1.1,1.4,1.6,1.8,2,2.3])], fibre={"AOAC":[.6,1.2,1.8,2.4,3,3.6,4.2,4.8,5.4,6]}, protein=[1.7,3.4,5.1,6.8,8.5], fv="fvns")
 }
 
+# Transcribed current H&B threshold reference from the supplied prototype.
+# These are comparisons against entered values, not a governed compliance decision.
+HB_THRESHOLDS = {
+    "Banana and plantain chips": [("sugar", "<=", 15), ("sat", "<=", 19)],
+    "Bread substitutes": [("sat", "<=", 2.8), ("fibre", ">=", 3), ("salt", "<=", 1.2)],
+    "Breakfast cereals": [("sugar", "<=", 16), ("sat", "<=", 2.8), ("fibre", ">=", 6), ("salt", "<=", .9)],
+    "Broths": [("salt", "<=", .59)],
+    "Brown bread": [("fibre", ">", 10), ("salt", "<=", 1.08)],
+    "Cakes": [("sugar", "<=", 15), ("sat", "<=", 11), ("salt", "<=", .66)],
+    "Chewing gum and mints": [("addedSugarStatus", "no", None)],
+    "Chips / crisps": [("sat", "<=", 3), ("salt", "<=", 1.1)],
+    "Chocolate spread": [("sugar", "<=", 15), ("sat", "<=", 9)],
+    "Cold tomato / vegetable sauces": [("sugar", "<=", 16), ("salt", "<=", 1.63)],
+    "Cookies": [("sugar", "<=", 18), ("sat", "<=", 11), ("salt", "<=", .76)],
+    "Dairy and plant-based drinks": [("sugar", "<=", 4.5)],
+    "Emulsion-based sauces": [("salt", "<=", 1)],
+    "Fruit and vegetable juices": [("addedSugarStatus", "no", None)],
+    "Grain, muesli, fruit and energy bars": [("sugar", "<=", 20), ("sat", "<=", 5), ("salt", "<=", .4)],
+    "Hot beverages": [("sugar", "<=", 4.5)],
+    "Meat substitutes": [("sat", "<=", 18.1), ("salt", "<=", 1.3)],
+    "Nut-based spreads": [("sugar", "<=", 10), ("sat", "<=", 6), ("salt", "<=", .84)],
+    "Other savoury snacks": [("sat", "<=", 2.5), ("salt", "<=", 1.5)],
+    "Other savoury spreads": [("sat", "<=", 2.5), ("salt", "<=", 1.1)],
+    "Protein bar": [("sugar", "<=", 20), ("sat", "<=", 5), ("fibre", ">=", 6), ("salt", "<=", .8)],
+    "Salted nuts and seeds": [("salt", "<=", 1.2)],
+    "Soft drinks, energy drinks and prepared syrups": [("sugar", "<=", 4.5)],
+    "Soups": [("salt", "<=", .59)],
+    "Sweet spreads": [("sugar", "<=", 27)],
+    "Sweets": [("sugar", "<=", 15)],
+    "Warm tomato / vegetable sauces": [("salt", "<=", 1.1)],
+    "Chocolate": [("sugar", "<=", 30)],
+}
+HB_METRIC_LABELS = {"sugar":"Total sugars", "sat":"Saturated fat", "salt":"Salt", "fibre":"Fibre", "protein":"Protein", "plantPoints":"Plant points", "proteinEnergyPct":"Energy from protein"}
+
+
+def check_hb_thresholds(category: str, x: dict, added_sugar: str) -> list[dict]:
+    values={"sugar":x.get("sugar"),"sat":x.get("sat"),"salt":x.get("salt"),"fibre":x.get("fibre"),"protein":x.get("protein"),"plantPoints":x.get("plantPoints"),"proteinEnergyPct":x.get("proteinEnergyPct")}
+    rows=[]
+    for key,operator,target in HB_THRESHOLDS[category]:
+        label="Added-sugar status" if key=="addedSugarStatus" else HB_METRIC_LABELS[key]
+        if key=="addedSugarStatus":
+            status="PENDING" if added_sugar=="Unknown — review needed" else ("PASS" if added_sugar=="Confirmed no added sugar" else "FAIL")
+            observed=added_sugar
+            target_text="No added sugar"
+        else:
+            observed=values[key]
+            unit="points" if key=="plantPoints" else "%" if key=="proteinEnergyPct" else "g"
+            target_text=f"{operator} {fmt(target)} {unit}"
+            if observed is None:
+                status="PENDING"
+            else:
+                passed={"<=":observed<=target,">=":observed>=target,"<":observed<target,">":observed>target}[operator]
+                status="PASS" if passed else "FAIL"
+            observed="Not entered" if observed is None else f"{fmt(observed)} {unit}"
+        rows.append({"Nutrient / criterion":label,"Entered value":observed,"Threshold":target_text,"Status":status})
+    return rows
+
 def points(value, thresholds): return sum(value > t for t in thresholds)
 def fmt(v): return f"{v:g}"
 def score_model(model, x, kind):
@@ -90,6 +149,97 @@ def score_model(model, x, kind):
         arows.append({"Group":"C","Input":label,"Value":fmt(v),"Threshold applied":("≤ "+fmt(lim[0]) if p==0 else "> "+fmt(lim[p-1])),"Points":p,"Included":"Yes" if label!="Protein (g)" or protein_used else "No · protein gate"})
     C=fvp+fp+(pp if protein_used else 0); total=A-C; threshold=1 if kind=="Drink" else 4
     return {"model":model,"blocked":False,"A":A,"C":C,"score":total,"threshold":threshold,"classification":"Less healthy" if total>=threshold else "Not less healthy","protein_used":protein_used,"ledger":arows,"notes":"Salt converted to sodium (salt × 400)." if model=="2004/05" else "Comparison scenario uses verified free sugars and FVNS values."}
+
+
+def build_assessment_pdf(record: dict) -> bytes:
+    """Create a compact, printable evidence report for the current assessment."""
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_LEFT, TA_RIGHT
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.platypus import (Paragraph, SimpleDocTemplate, Spacer, Table,
+                                    TableStyle, KeepTogether)
+
+    ink=colors.HexColor("#263B32"); forest=colors.HexColor("#174B3B")
+    pale=colors.HexColor("#EEF3E9"); line=colors.HexColor("#D9E2D8")
+    muted=colors.HexColor("#66756D"); amber=colors.HexColor("#FBF3DF")
+    buf=BytesIO()
+    doc=SimpleDocTemplate(buf,pagesize=A4,rightMargin=17*mm,leftMargin=17*mm,
+                          topMargin=19*mm,bottomMargin=17*mm,
+                          title="Nutrition Product Assessment",author="Nutrition Product Tool")
+    styles=getSampleStyleSheet()
+    styles.add(ParagraphStyle(name="ReportTitle",parent=styles["Title"],fontName="Helvetica-Bold",fontSize=20,leading=24,textColor=forest,alignment=TA_LEFT,spaceAfter=3))
+    styles.add(ParagraphStyle(name="Section",parent=styles["Heading2"],fontName="Helvetica-Bold",fontSize=11,leading=14,textColor=forest,spaceBefore=10,spaceAfter=5,keepWithNext=True))
+    styles.add(ParagraphStyle(name="BodySmall",parent=styles["BodyText"],fontName="Helvetica",fontSize=8.2,leading=11,textColor=ink))
+    styles.add(ParagraphStyle(name="MutedSmall",parent=styles["BodyText"],fontName="Helvetica",fontSize=7.5,leading=10,textColor=muted))
+    styles.add(ParagraphStyle(name="TableHead",parent=styles["BodyText"],fontName="Helvetica-Bold",fontSize=7.4,leading=9,textColor=colors.white))
+    styles.add(ParagraphStyle(name="TableCell",parent=styles["BodyText"],fontName="Helvetica",fontSize=7.2,leading=9,textColor=ink))
+    styles.add(ParagraphStyle(name="MetaLabel",parent=styles["BodyText"],fontName="Helvetica-Bold",fontSize=6.8,leading=8,textColor=forest))
+    def para(value, style="TableCell"):
+        # ReportLab's built-in Helvetica is reliable for standard ASCII. Replace
+        # unsupported characters rather than letting a product name break export.
+        clean=str(value if value not in (None,"") else "Not provided").encode("latin-1","replace").decode("latin-1")
+        return Paragraph(escape(clean),styles[style])
+    def grid(data,widths,header=True):
+        t=Table(data,colWidths=widths,repeatRows=1 if header else 0,hAlign="LEFT")
+        cmds=[("VALIGN",(0,0),(-1,-1),"TOP"),("LEFTPADDING",(0,0),(-1,-1),6),("RIGHTPADDING",(0,0),(-1,-1),6),("TOPPADDING",(0,0),(-1,-1),5),("BOTTOMPADDING",(0,0),(-1,-1),5),("LINEBELOW",(0,0),(-1,-1),.35,line)]
+        if header: cmds += [("BACKGROUND",(0,0),(-1,0),forest),("TEXTCOLOR",(0,0),(-1,0),colors.white)]
+        t.setStyle(TableStyle(cmds)); return t
+    inp=record.get("inputs",{}); results=record.get("results",[])
+    run_at=record.get("timestamp","")
+    try: run_at=datetime.fromisoformat(run_at).astimezone().strftime("%d %b %Y, %H:%M %Z")
+    except (ValueError,TypeError): run_at=str(run_at or "Not available")
+    story=[Paragraph("Nutrition Product Assessment",styles["ReportTitle"]),
+           Paragraph("NPM calculation record · generated from entered product data",styles["MutedSmall"]),Spacer(1,8)]
+    meta=[
+        [para("DATE RUN","MetaLabel"),para(run_at),para("USER / REVIEWER","MetaLabel"),para(inp.get("reviewer"))],
+        [para("PRODUCT ID","MetaLabel"),para(inp.get("sku")),para("PRODUCT NAME","MetaLabel"),para(inp.get("name"))],
+        [para("PRODUCT TYPE","MetaLabel"),para(inp.get("product_type")),para("ASSESSMENT BASIS","MetaLabel"),para(inp.get("assessment_basis"))],
+        [para("REVIEW DECISION","MetaLabel"),para(inp.get("review_decision")),para("RULESET","MetaLabel"),para(record.get("rulesetBuild"))],
+    ]
+    meta_table=Table(meta,colWidths=[25*mm,58*mm,29*mm,58*mm],hAlign="LEFT")
+    meta_table.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),pale),("BOX",(0,0),(-1,-1),.6,line),("INNERGRID",(0,0),(-1,-1),.35,line),("VALIGN",(0,0),(-1,-1),"TOP"),("LEFTPADDING",(0,0),(-1,-1),6),("RIGHTPADDING",(0,0),(-1,-1),6),("TOPPADDING",(0,0),(-1,-1),6),("BOTTOMPADDING",(0,0),(-1,-1),6)]))
+    story.extend([meta_table,Paragraph("NPM results",styles["Section"])])
+    summary=[[para(x,"TableHead") for x in ["MODEL","STATUS","SCORE","THRESHOLD","A POINTS","C POINTS"]]]
+    for res in results:
+        summary.append([para(NPM[res["model"]]["id"]),para("Blocked - missing evidence" if res["blocked"] else res["classification"]),para("-" if res["blocked"] else res["score"]),para("-" if res["blocked"] else res["threshold"]),para("-" if res["blocked"] else res["A"]),para("-" if res["blocked"] else res["C"])])
+    story.append(grid(summary,[36*mm,49*mm,17*mm,23*mm,20*mm,20*mm]))
+    story.append(Paragraph("Assessment inputs",styles["Section"]))
+    input_rows=[[para("NUTRITION VALUE","TableHead"),para("ENTERED VALUE","TableHead"),para("SPECIALIST / EVIDENCE","TableHead")]]
+    for label,key,unit in [("Energy","energy","kJ"),("Saturated fat","sat","g"),("Total sugars","sugar","g"),("Free sugars","freeSugar","g"),("Salt","salt","g"),("Protein","protein","g"),("Fibre","fibre","g"),("FVN","fvn","%"),("FVNS","fvns","%")]:
+        v=inp.get(key)
+        input_rows.append([para(label),para("Not entered" if v is None else f"{fmt(v)} {unit}"),para(inp.get("nutrition_source") if key in ("energy","sat","sugar","salt","protein","fibre") else inp.get("specialist_source"))])
+    story.append(grid(input_rows,[48*mm,36*mm,81*mm]))
+    cat=[("L1 category","l1"),("L2 category","l2"),("L3 category","l3"),("L4 category","l4")]
+    story.append(Paragraph("Product classification & review",styles["Section"]))
+    story.append(grid([[para("CATEGORY LEVEL","TableHead"),para("SELECTION","TableHead")]]+[[para(label),para(inp.get(key))] for label,key in cat], [48*mm,117*mm]))
+    if inp.get("review_notes"):
+        story.extend([Spacer(1,5),para("Review note: "+inp["review_notes"],"BodySmall")])
+    if inp.get("ingredients"):
+        story.extend([Paragraph("Ingredient declaration",styles["Section"]),para(inp["ingredients"],"BodySmall")])
+    story.append(Paragraph("Calculation detail",styles["Section"]))
+    for res in results:
+        block=[Paragraph(NPM[res["model"]]["label"],styles["BodySmall"])]
+        if res["blocked"]:
+            block.append(para("Calculation blocked. Missing or invalid: "+", ".join(res["missing"]),"BodySmall"))
+        else:
+            rows=[[para(x,"TableHead") for x in ["GROUP","INPUT","VALUE","THRESHOLD","POINTS","INCLUDED"]]]
+            for row in res["ledger"]:
+                rows.append([para(row[k]) for k in ["Group","Input","Value","Threshold applied","Points","Included"]])
+            block.append(grid(rows,[14*mm,43*mm,22*mm,35*mm,17*mm,34*mm]))
+            block.append(para(f"A {res['A']} - C {res['C']} = {res['score']}. {res['notes']}","MutedSmall"))
+        story.extend([KeepTogether(block),Spacer(1,6)])
+    story.extend([Spacer(1,8),para("This report records entered data and deterministic calculations. It is a working aid and does not replace regulatory review, evidence verification or product sign-off.","MutedSmall")])
+    def footer(canvas,document):
+        canvas.saveState(); w,h=A4
+        canvas.setStrokeColor(line); canvas.line(17*mm,13*mm,w-17*mm,13*mm)
+        canvas.setFont("Helvetica",7); canvas.setFillColor(muted)
+        canvas.drawString(17*mm,8*mm,"Nutrition Product Tool | Assessment evidence")
+        canvas.drawRightString(w-17*mm,8*mm,f"Page {document.page}")
+        canvas.restoreState()
+    doc.build(story,onFirstPage=footer,onLaterPages=footer)
+    return buf.getvalue()
 
 with st.sidebar:
     st.markdown("### Your assessment")
@@ -123,7 +273,7 @@ with assessment:
                     l3=st.selectbox("L3 category",[""]+l3_options,key="category_l3",disabled=not bool(l2),format_func=lambda v:v or ("Select L3 category" if l2 else "Select L2 first"),on_change=_clear_category_children,args=(3,))
                     l4_options=sorted(CATEGORY_TREE.loc[CATEGORY_TREE[CATEGORY_COLUMNS[2]].eq(l3)&CATEGORY_TREE[CATEGORY_COLUMNS[1]].eq(l2)&CATEGORY_TREE[CATEGORY_COLUMNS[0]].eq(l1),CATEGORY_COLUMNS[3]].loc[lambda s:s.ne("")].unique().tolist()) if l3 else []
                     l4=st.selectbox("L4 category",[""]+l4_options,key="category_l4",disabled=not bool(l3),format_func=lambda v:v or ("Select L4 category" if l3 else "Select L3 first"))
-            with c2: reviewer=st.text_input("Reviewer"); decision=st.selectbox("Reviewer decision",["Not reviewed","Accepted","Accepted with caveat","Overridden"]); nutrition_source=st.text_input("Nutrition source"); specialist_source=st.text_input("Specialist data source")
+            with c2: reviewer=st.text_input("User / reviewer"); decision=st.selectbox("Reviewer decision",["Not reviewed","Accepted","Accepted with caveat","Overridden"]); nutrition_source=st.text_input("Nutrition source"); specialist_source=st.text_input("Specialist data source")
             ingredients=st.text_area("Ingredient declaration",height=110,placeholder="Paste the legal ingredient declaration. Text is stored as evidence; it is not used to infer NPM inputs.")
             review_notes=st.text_area("Review rationale / caveat",height=70)
         with st.container(border=True):
@@ -141,7 +291,7 @@ with assessment:
             st.markdown('<div class="amber-note">FVN, FVNS and free sugars must not be inferred from an ingredient list alone. Missing verified values block the relevant model.</div>',unsafe_allow_html=True)
             calc=st.button("Calculate both NPM models",type="primary",use_container_width=True)
             example=st.button("Load worked 2004/05 example")
-    x={"energy":energy,"sat":sat,"sugar":sugar,"salt":salt,"sodium":salt*400 if salt is not None else None,"protein":protein,"fibre":fibre,"freeSugar":free_sugar,"fvn":fvn,"fvns":fvns,"fibreMethod":fibre_method}
+    x={"energy":energy,"sat":sat,"sugar":sugar,"salt":salt,"sodium":salt*400 if salt is not None else None,"protein":protein,"fibre":fibre,"freeSugar":free_sugar,"fvn":fvn,"fvns":fvns,"fibreMethod":fibre_method,"plantPoints":plant,"proteinEnergyPct":protein_pct}
     if example:
         x.update(dict(energy=459,sat=1.8,sugar=13.4,salt=.00025,sodium=.1,protein=6.5,fibre=.6,fvn=8,fvns=None,freeSugar=None,fibreMethod="AOAC"))
         st.session_state["demo_result"]=[score_model(m,x,"Food") for m in NPM]
@@ -166,8 +316,33 @@ with assessment:
             for r in results:
                 st.markdown(f"**{NPM[r['model']]['id']}**")
                 if not r["blocked"]: st.dataframe(pd.DataFrame(r["ledger"]),hide_index=True,use_container_width=True)
+        st.markdown("### H&B threshold check")
+        st.caption("Choose a product category to compare its entered nutrient values with the reference thresholds.")
+        hb_category=st.selectbox("H&B threshold category",list(HB_THRESHOLDS),key="hb_threshold_category")
+        run_hb_check=st.button("Check selected threshold",key="run_hb_check",use_container_width=True)
+        hb_inputs={**x,"addedSugarStatus":added}
+        if run_hb_check:
+            st.session_state["hb_check_result"]={"category":hb_category,"inputs":hb_inputs,"rows":check_hb_thresholds(hb_category,x,added)}
+        saved_hb=st.session_state.get("hb_check_result")
+        if saved_hb:
+            if saved_hb["category"]!=hb_category or saved_hb["inputs"]!=hb_inputs:
+                st.info("Product values or category have changed since the last check. Run the check again.")
+            else:
+                failed=[row["Nutrient / criterion"] for row in saved_hb["rows"] if row["Status"]=="FAIL"]
+                pending=[row["Nutrient / criterion"] for row in saved_hb["rows"] if row["Status"]=="PENDING"]
+                if failed: st.error("Outside selected threshold: " + ", ".join(failed))
+                elif pending: st.warning("Check incomplete. Add or confirm: " + ", ".join(pending))
+                else: st.success("All checked criteria are within the selected thresholds.")
+                st.dataframe(pd.DataFrame(saved_hb["rows"]),hide_index=True,use_container_width=True)
+                st.caption("Reference comparison only; confirm thresholds against the current controlled H&B policy before making a product decision.")
+        if results:
             record={"timestamp":datetime.now(timezone.utc).isoformat(),"rulesetBuild":"2026-09-10 v0.1","inputs":{"sku":sku,"name":name,"product_type":kind,"assessment_basis":basis,"l1":l1,"l2":l2,"l3":l3,"l4":l4,"ingredients":ingredients,"reviewer":reviewer,"review_decision":decision,"review_notes":review_notes,"nutrition_source":nutrition_source,"specialist_source":specialist_source,**x},"results":results}
-            st.download_button("Download assessment record · JSON",json.dumps(record,indent=2),file_name=f"nutrition-assessment-{re.sub(r'[^a-zA-Z0-9_-]','-',sku or 'draft')}.json",mime="application/json")
+            safe_sku=re.sub(r'[^a-zA-Z0-9_-]','-',sku or 'draft')
+            json_col,pdf_col=st.columns(2)
+            with json_col:
+                st.download_button("Download assessment record · JSON",json.dumps(record,indent=2),file_name=f"nutrition-assessment-{safe_sku}.json",mime="application/json",use_container_width=True)
+            with pdf_col:
+                st.download_button("Download assessment report · PDF",build_assessment_pdf(record),file_name=f"nutrition-assessment-{safe_sku}.pdf",mime="application/pdf",use_container_width=True)
 
 with scope:
     st.markdown("## A considered category estimate")
