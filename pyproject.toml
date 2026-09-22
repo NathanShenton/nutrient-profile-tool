@@ -1,17 +1,21 @@
-[tool.poetry]
+[project]
 name = "nutrition-product-tool"
 version = "0.1.0"
 description = "Nutrition product assessment Streamlit app"
-authors = []
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "streamlit",
+    "pandas",
+    "requests",
+    "reportlab",
+]
+
+[tool.poetry]
 package-mode = false
 
-[tool.poetry.dependencies]
-python = ">=3.10,<3.14"
-streamlit = "*"
-pandas = "*"
-requests = "*"
-reportlab = "*"
+[tool.uv]
+package = false
 
 [build-system]
-requires = ["poetry-core>=1.0.0"]
+requires = ["poetry-core>=2.0.0"]
 build-backend = "poetry.core.masonry.api"
