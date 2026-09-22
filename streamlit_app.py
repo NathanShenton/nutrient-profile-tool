@@ -18,7 +18,7 @@ import pandas as pd
 import streamlit as st
 
 
-st.set_page_config(page_title="Nutrition, thoughtfully", page_icon="🌿", layout="wide")
+st.set_page_config(page_title="Nutrient Profile Tool", page_icon="🌿", layout="wide")
 CATEGORY_FILE = Path(__file__).with_name("dwh_odl_dim_categories_fpna.csv")
 CATEGORY_COLUMNS = [
     "category_fpna_l1_name", "category_fpna_l2_name",
@@ -114,7 +114,7 @@ INGREDIENT_REVIEW_PROMPTS = [
     ("Nitrites and nitrates", ["nitrite", "nitrate"]),
     ("Phosphates and chelating agents", ["phosphate", "phosphoric acid", "EDTA", "ethylenediaminetetraacetic"]),
     ("Synthetic antioxidant review", ["BHA", "BHT", "TBHQ", "propyl gallate"]),
-    ("Emulsifier review", ["emulsifier", "mono-and diglyceride", "mono and diglyceride", "monoand diglyceride", "polysorbate"]),
+    ("Emulsifier review", ["emulsifier", "mono-and diglycerides", "mono and diglycerides", "monoand diglycerides", "mono-and diglyceride", "mono and diglyceride", "monoand diglyceride", "polysorbate"]),
     ("Artificial sweetener review", ["aspartame", "acesulfame", "saccharin", "cyclamate", "sucralose"]),
     ("Artificial colour review", ["artificial colour", "artificial color", "tartrazine", "sunset yellow", "quinoline yellow", "allura red"]),
     ("Processing-aid review", ["processing aid"]),
@@ -128,6 +128,31 @@ BULK_TEMPLATE_COLUMNS = [
     "reviewer", "review_decision", "review_notes", "added_sugar_status",
     "hb_threshold_category", "plant_points", "protein_energy_percent",
 ]
+
+
+def scan_ingredient_review(ingredients: str) -> list[dict]:
+    """Return each keyword match with its source text, search term and review area."""
+    source=ingredients or ""
+    matches=[]
+    for area,terms in INGREDIENT_REVIEW_PROMPTS:
+        group_hits=[]
+        occupied_spans=[]
+        for term in sorted(terms,key=len,reverse=True):
+            pattern=rf"\b{re.escape(term)}\b" if term.casefold() in {"bha","bht"} else re.escape(term)
+            for found in re.finditer(pattern,source,flags=re.IGNORECASE):
+                span=found.span()
+                if any(span[0]<end and span[1]>start for start,end in occupied_spans):
+                    continue
+                occupied_spans.append(span)
+                separators=[source.rfind(",",0,span[0]),source.rfind(";",0,span[0])]
+                left=max(separators)+1
+                following=[position for position in (source.find(",",span[1]),source.find(";",span[1])) if position>=0]
+                right=min(following) if following else len(source)
+                group_hits.append({"reviewArea":area,"matchedIngredient":source[left:right].strip(),"matchedText":found.group(0),"searchTerm":term,"_start":span[0]})
+        matches.extend(sorted(group_hits,key=lambda item:item["_start"]))
+    for item in matches:
+        item.pop("_start",None)
+    return matches
 
 
 def safe_filename_part(value: str, fallback: str) -> str:
@@ -180,6 +205,7 @@ def bulk_row_to_record(row: dict, index: int, run_timestamp: str, default_review
     results=[score_model(model,x,kind) for model in NPM]
     record={"timestamp":run_timestamp,"rulesetBuild":"2026-09-10 v0.1","runType":"bulk user calculation",
         "inputs":inputs,"results":results,"inputWarnings":warnings,
+        "ingredientPromptMatches":scan_ingredient_review(inputs["ingredients"]),
         "hbThresholdCheck":{"category":threshold_category,"rows":check_hb_thresholds(threshold_category,x,added) if threshold_category else []}}
     filename=f"{safe_filename_part(sku,'SKU')} - {safe_filename_part(name,'Product')}.pdf"
     return record,filename
@@ -325,6 +351,18 @@ def build_assessment_pdf(record: dict) -> bytes:
         story.extend([Spacer(1,5),para("Review note: "+inp["review_notes"],"BodySmall")])
     if inp.get("ingredients"):
         story.extend([Paragraph("Ingredient declaration",styles["Section"]),para(inp["ingredients"],"BodySmall")])
+    story.append(Paragraph("Ingredient review prompts",styles["Section"]))
+    prompt_matches=record.get("ingredientPromptMatches",[])
+    if not inp.get("ingredients"):
+        story.append(para("No ingredient declaration was provided; keyword review was not run.","BodySmall"))
+    elif prompt_matches:
+        story.append(para("The following text matched the app's keyword list. Review each item against the controlled additive policy; this is not a compliance decision.","MutedSmall"))
+        prompt_rows=[[para(x,"TableHead") for x in ["REVIEW AREA","INGREDIENT TEXT (AS ENTERED)","MATCHED TEXT","SEARCH TERM"]]]
+        prompt_rows.extend([[para(item.get("reviewArea")),para(item.get("matchedIngredient")),para(item.get("matchedText")),para(item.get("searchTerm"))] for item in prompt_matches])
+        story.append(grid(prompt_rows,[38*mm,61*mm,32*mm,34*mm]))
+    else:
+        story.append(para("No prototype keyword prompts found. This does not confirm policy compliance.","BodySmall"))
+    story.append(para("Keyword matching only; check the ingredient and its function against the current controlled policy.","MutedSmall"))
     story.append(Paragraph("H&B internal threshold comparison",styles["Section"]))
     hb=record.get("hbThresholdCheck") or {}
     if not hb.get("category"):
@@ -473,7 +511,17 @@ with assessment:
         if results:
             run_inputs=run["inputs"]
             record={"timestamp":run["timestamp"],"rulesetBuild":"2026-09-10 v0.1","runType":run["source"],"inputs":run_inputs,"results":results,
+                    "ingredientPromptMatches":scan_ingredient_review(run_inputs.get("ingredients","")),
                     "hbThresholdCheck":{"category":hb_category,"rows":check_hb_thresholds(hb_category,run_inputs,run_inputs.get("addedSugarStatus","Unknown — review needed"))},"inputWarnings":[]}
+            prompt_matches=record["ingredientPromptMatches"]
+            with st.expander(f"Ingredient review prompts · {len(prompt_matches)} match(es)",expanded=bool(prompt_matches)):
+                if prompt_matches:
+                    st.dataframe(pd.DataFrame(prompt_matches).rename(columns={"reviewArea":"Review area","matchedIngredient":"Ingredient text (as entered)","matchedText":"Matched text","searchTerm":"Search term"}),hide_index=True,use_container_width=True)
+                    st.caption("Keyword matches need review against the controlled additive policy; they are not a compliance decision.")
+                elif run_inputs.get("ingredients"):
+                    st.caption("No prototype keyword prompts found in the ingredient declaration. This does not confirm compliance.")
+                else:
+                    st.caption("No ingredient declaration was provided; keyword review was not run.")
             safe_sku=re.sub(r'[^a-zA-Z0-9_-]','-',run["inputs"].get("sku") or 'draft')
             json_col,pdf_col=st.columns(2)
             with json_col:
@@ -581,6 +629,15 @@ with bulk:
             statuses=[f"{NPM[result['model']]['id']}: {('blocked' if result['blocked'] else result['classification'])}" for result in results]
             st.download_button(f"Download {output['filename']}",output["pdf"],file_name=output["filename"],mime="application/pdf",key=f"bulk_pdf_{index}")
             st.caption(f"{input_data['sku']} · {input_data['name']} — {'; '.join(statuses)}")
+            prompt_matches=record.get("ingredientPromptMatches",[])
+            with st.expander(f"Ingredient review · {input_data['sku']} · {len(prompt_matches)} match(es)"):
+                if prompt_matches:
+                    st.dataframe(pd.DataFrame(prompt_matches).rename(columns={"reviewArea":"Review area","matchedIngredient":"Ingredient text (as entered)","matchedText":"Matched text","searchTerm":"Search term"}),hide_index=True,use_container_width=True)
+                    st.caption("Review each match against the controlled additive policy.")
+                elif input_data.get("ingredients"):
+                    st.caption("No prototype keyword prompts found. This does not confirm compliance.")
+                else:
+                    st.caption("No ingredient declaration was provided; keyword review was not run.")
 
 with scope:
     st.markdown("## A considered category estimate")
@@ -690,21 +747,14 @@ with guide:
     st.markdown("### Ingredient review prompts")
     st.caption("A lightweight keyword prompt only. It does not determine compliance or replace the controlled additive policy.")
     st.dataframe(pd.DataFrame([{"Review area":label,"Terms scanned":", ".join(terms)} for label,terms in INGREDIENT_REVIEW_PROMPTS]),hide_index=True,use_container_width=True)
-    st.caption("The scan is case-insensitive. BHA and BHT are matched as whole words. To change what it checks, edit `INGREDIENT_REVIEW_PROMPTS` in app.py; the table and scan use the same list.")
+    st.caption("The scan is case-insensitive. BHA and BHT are matched as whole words. To change what it checks, edit `INGREDIENT_REVIEW_PROMPTS` in app.py; the table, single and bulk runs use the same list.")
     ingredient_text=st.text_area("Ingredient declaration to review",value=ingredients,key="ingredient_screen",height=110)
     if st.button("Scan for review prompts"):
-        text=ingredient_text.lower()
-        hits=[]
-        for label,terms in INGREDIENT_REVIEW_PROMPTS:
-            for term in terms:
-                pattern=rf"\b{re.escape(term.lower())}\b" if term.lower() in {"bha","bht"} else re.escape(term.lower())
-                if re.search(pattern,text):
-                    hits.append(label)
-                    break
-        if not text.strip(): st.warning("Paste an ingredient declaration first.")
-        elif hits:
-            st.warning(f"{len(hits)} review prompt(s) found. Check each against the controlled additive policy and technical function.")
-            for hit in hits: st.write("• " + hit)
+        matches=scan_ingredient_review(ingredient_text)
+        if not ingredient_text.strip(): st.warning("Paste an ingredient declaration first.")
+        elif matches:
+            st.warning(f"{len(matches)} keyword match(es) found. Check each against the controlled additive policy and technical function.")
+            st.dataframe(pd.DataFrame(matches).rename(columns={"reviewArea":"Review area","matchedIngredient":"Ingredient text (as entered)","matchedText":"Matched text","searchTerm":"Search term"}),hide_index=True,use_container_width=True)
         else: st.success("No prototype keyword prompts found. This does not confirm policy compliance.")
     st.markdown('<div class="leaf-note">Use this as a transparent working aid. Regulatory interpretation, evidence quality and final product decisions remain with qualified reviewers.</div>',unsafe_allow_html=True)
 
