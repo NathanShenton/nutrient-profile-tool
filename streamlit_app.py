@@ -8,12 +8,31 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
 
 st.set_page_config(page_title="Nutrition, thoughtfully", page_icon="🌿", layout="wide")
+CATEGORY_FILE = Path(__file__).with_name("dwh_odl_dim_categories_fpna.csv")
+CATEGORY_COLUMNS = [
+    "category_fpna_l1_name", "category_fpna_l2_name",
+    "category_fpna_l3_name", "category_fpna_l4_name",
+]
+try:
+    CATEGORY_TREE = pd.read_csv(CATEGORY_FILE, dtype=str).fillna("")
+    CATEGORY_TREE = CATEGORY_TREE[CATEGORY_COLUMNS].drop_duplicates()
+except (OSError, ValueError, KeyError):
+    CATEGORY_TREE = pd.DataFrame(columns=CATEGORY_COLUMNS)
+
+
+def _clear_category_children(level: int) -> None:
+    """Clear lower-level selections when a parent picklist changes."""
+    for child in range(level + 1, 5):
+        st.session_state.pop(f"category_l{child}", None)
+
+
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Playfair+Display:wght@600;700&display=swap');
@@ -91,7 +110,19 @@ with assessment:
         with st.container(border=True):
             st.markdown("### Product details & review")
             c1,c2=st.columns(2)
-            with c1: l1=st.text_input("L1 category"); l2=st.text_input("L2 category"); l3=st.text_input("L3 category"); l4=st.text_input("L4 category")
+            with c1:
+                if CATEGORY_TREE.empty:
+                    st.error("Category dictionary not found or has unexpected columns. Keep the supplied CSV beside app.py.")
+                    l1=l2=l3=l4=""
+                else:
+                    l1_options=sorted(CATEGORY_TREE[CATEGORY_COLUMNS[0]].loc[lambda s:s.ne("")].unique().tolist())
+                    l1=st.selectbox("L1 category",[""]+l1_options,key="category_l1",format_func=lambda v:v or "Select L1 category",on_change=_clear_category_children,args=(1,))
+                    l2_options=sorted(CATEGORY_TREE.loc[CATEGORY_TREE[CATEGORY_COLUMNS[0]].eq(l1),CATEGORY_COLUMNS[1]].loc[lambda s:s.ne("")].unique().tolist()) if l1 else []
+                    l2=st.selectbox("L2 category",[""]+l2_options,key="category_l2",disabled=not bool(l1),format_func=lambda v:v or ("Select L2 category" if l1 else "Select L1 first"),on_change=_clear_category_children,args=(2,))
+                    l3_options=sorted(CATEGORY_TREE.loc[CATEGORY_TREE[CATEGORY_COLUMNS[1]].eq(l2)&CATEGORY_TREE[CATEGORY_COLUMNS[0]].eq(l1),CATEGORY_COLUMNS[2]].loc[lambda s:s.ne("")].unique().tolist()) if l2 else []
+                    l3=st.selectbox("L3 category",[""]+l3_options,key="category_l3",disabled=not bool(l2),format_func=lambda v:v or ("Select L3 category" if l2 else "Select L2 first"),on_change=_clear_category_children,args=(3,))
+                    l4_options=sorted(CATEGORY_TREE.loc[CATEGORY_TREE[CATEGORY_COLUMNS[2]].eq(l3)&CATEGORY_TREE[CATEGORY_COLUMNS[1]].eq(l2)&CATEGORY_TREE[CATEGORY_COLUMNS[0]].eq(l1),CATEGORY_COLUMNS[3]].loc[lambda s:s.ne("")].unique().tolist()) if l3 else []
+                    l4=st.selectbox("L4 category",[""]+l4_options,key="category_l4",disabled=not bool(l3),format_func=lambda v:v or ("Select L4 category" if l3 else "Select L3 first"))
             with c2: reviewer=st.text_input("Reviewer"); decision=st.selectbox("Reviewer decision",["Not reviewed","Accepted","Accepted with caveat","Overridden"]); nutrition_source=st.text_input("Nutrition source"); specialist_source=st.text_input("Specialist data source")
             ingredients=st.text_area("Ingredient declaration",height=110,placeholder="Paste the legal ingredient declaration. Text is stored as evidence; it is not used to infer NPM inputs.")
             review_notes=st.text_area("Review rationale / caveat",height=70)
