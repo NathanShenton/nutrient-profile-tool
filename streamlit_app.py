@@ -18,7 +18,7 @@ import pandas as pd
 import streamlit as st
 
 
-st.set_page_config(page_title="Nutrient Profile Tool", page_icon="🌿", layout="wide")
+st.set_page_config(page_title="Nutrition, thoughtfully", page_icon="🌿", layout="wide")
 CATEGORY_FILE = Path(__file__).with_name("dwh_odl_dim_categories_fpna.csv")
 CATEGORY_COLUMNS = [
     "category_fpna_l1_name", "category_fpna_l2_name",
@@ -109,6 +109,16 @@ HB_THRESHOLDS = {
     "Chocolate": [("sugar", "<=", 30)],
 }
 HB_METRIC_LABELS = {"sugar":"Total sugars", "sat":"Saturated fat", "salt":"Salt", "fibre":"Fibre", "protein":"Protein", "plantPoints":"Plant points", "proteinEnergyPct":"Energy from protein"}
+INGREDIENT_REVIEW_PROMPTS = [
+    ("Benzoates", ["benzoate", "benzoic acid"]),
+    ("Nitrites and nitrates", ["nitrite", "nitrate"]),
+    ("Phosphates and chelating agents", ["phosphate", "phosphoric acid", "EDTA", "ethylenediaminetetraacetic"]),
+    ("Synthetic antioxidant review", ["BHA", "BHT", "TBHQ", "propyl gallate"]),
+    ("Emulsifier review", ["emulsifier", "mono-and diglyceride", "mono and diglyceride", "monoand diglyceride", "polysorbate"]),
+    ("Artificial sweetener review", ["aspartame", "acesulfame", "saccharin", "cyclamate", "sucralose"]),
+    ("Artificial colour review", ["artificial colour", "artificial color", "tartrazine", "sunset yellow", "quinoline yellow", "allura red"]),
+    ("Processing-aid review", ["processing aid"]),
+]
 BULK_TEMPLATE_COLUMNS = [
     "sku_id", "sku_name", "product_type", "assessment_basis",
     "l1_category", "l2_category", "l3_category", "l4_category",
@@ -679,11 +689,18 @@ with guide:
     st.markdown("NPM classification alone does not establish whether a product is legally in scope of HFSS restrictions. The AI category estimate is optional and requires human review. Ingredient keyword prompts are not an additive policy screen, and a missing keyword match is not confirmation of compliance. Do not use the threshold references as approved pass/fail criteria.")
     st.markdown("### Ingredient review prompts")
     st.caption("A lightweight keyword prompt only. It does not determine compliance or replace the controlled additive policy.")
+    st.dataframe(pd.DataFrame([{"Review area":label,"Terms scanned":", ".join(terms)} for label,terms in INGREDIENT_REVIEW_PROMPTS]),hide_index=True,use_container_width=True)
+    st.caption("The scan is case-insensitive. BHA and BHT are matched as whole words. To change what it checks, edit `INGREDIENT_REVIEW_PROMPTS` in app.py; the table and scan use the same list.")
     ingredient_text=st.text_area("Ingredient declaration to review",value=ingredients,key="ingredient_screen",height=110)
     if st.button("Scan for review prompts"):
-        groups=[("Benzoates",r"benzoate|benzoic acid"),("Nitrites and nitrates",r"nitrite|nitrate"),("Phosphates and chelating agents",r"phosphate|phosphoric acid|edta|ethylenediaminetetraacetic"),("Synthetic antioxidant review",r"\bbha\b|\bbht\b|tbhq|propyl gallate"),("Emulsifier review",r"emulsifier|mono[- ]?and diglyceride|polysorbate"),("Artificial sweetener review",r"aspartame|acesulfame|saccharin|cyclamate|sucralose"),("Artificial colour review",r"artificial colou?r|tartrazine|sunset yellow|quinoline yellow|allura red"),("Processing-aid review",r"processing aid")]
         text=ingredient_text.lower()
-        hits=[label for label,pattern in groups if re.search(pattern,text)]
+        hits=[]
+        for label,terms in INGREDIENT_REVIEW_PROMPTS:
+            for term in terms:
+                pattern=rf"\b{re.escape(term.lower())}\b" if term.lower() in {"bha","bht"} else re.escape(term.lower())
+                if re.search(pattern,text):
+                    hits.append(label)
+                    break
         if not text.strip(): st.warning("Paste an ingredient declaration first.")
         elif hits:
             st.warning(f"{len(hits)} review prompt(s) found. Check each against the controlled additive policy and technical function.")
