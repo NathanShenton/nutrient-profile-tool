@@ -6,17 +6,19 @@ Calculations are a transparent working aid and do not replace expert or regulato
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 from io import BytesIO
 from datetime import datetime, timezone
 from pathlib import Path
 from xml.sax.saxutils import escape
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import pandas as pd
 import streamlit as st
 
 
-st.set_page_config(page_title="Nutrition Profile Tool", page_icon="🌿", layout="wide")
+st.set_page_config(page_title="Nutrition, thoughtfully", page_icon="🌿", layout="wide")
 CATEGORY_FILE = Path(__file__).with_name("dwh_odl_dim_categories_fpna.csv")
 CATEGORY_COLUMNS = [
     "category_fpna_l1_name", "category_fpna_l2_name",
@@ -107,6 +109,70 @@ HB_THRESHOLDS = {
     "Chocolate": [("sugar", "<=", 30)],
 }
 HB_METRIC_LABELS = {"sugar":"Total sugars", "sat":"Saturated fat", "salt":"Salt", "fibre":"Fibre", "protein":"Protein", "plantPoints":"Plant points", "proteinEnergyPct":"Energy from protein"}
+BULK_TEMPLATE_COLUMNS = [
+    "sku_id", "sku_name", "product_type", "assessment_basis",
+    "l1_category", "l2_category", "l3_category", "l4_category",
+    "ingredients", "energy_kj", "saturated_fat_g", "total_sugars_g",
+    "salt_g", "protein_g", "fibre_g", "fibre_method", "free_sugars_g",
+    "fvn_percent", "fvns_percent", "nutrition_source", "specialist_source",
+    "reviewer", "review_decision", "review_notes", "added_sugar_status",
+    "hb_threshold_category", "plant_points", "protein_energy_percent",
+]
+
+
+def safe_filename_part(value: str, fallback: str) -> str:
+    cleaned=re.sub(r'[<>:"/\\|?*\x00-\x1f]','_',str(value or "")).strip(" ._")
+    cleaned=re.sub(r"\s+"," ",cleaned)
+    return cleaned[:90] or fallback
+
+
+def bulk_row_to_record(row: dict, index: int, run_timestamp: str, default_reviewer: str="") -> tuple[dict, str]:
+    """Normalize one CSV row and produce its deterministic result record."""
+    def cell(key):
+        value=row.get(key,"")
+        return "" if value is None else str(value).strip()
+    sku=cell("sku_id"); name=cell("sku_name")
+    kind_value=cell("product_type").casefold()
+    kind="Drink" if kind_value in {"drink","beverage"} else "Food"
+    basis_value=cell("assessment_basis").casefold()
+    basis="Reconstituted to pack instructions" if any(word in basis_value for word in ("reconstituted","reconstituted to pack","prepared")) else "As sold"
+    fibre_raw=cell("fibre_method").casefold()
+    fibre_method="NSP / Englyst" if fibre_raw in {"nsp","englyst","nsp / englyst"} else "AOAC"
+    added_raw=cell("added_sugar_status").casefold()
+    if added_raw in {"no","no added sugar","confirmed no added sugar"}: added="Confirmed no added sugar"
+    elif added_raw in {"yes","added","added sugar present"}: added="Added sugar present"
+    else: added="Unknown — review needed"
+    warnings=[]
+    number_fields={"energy_kj":"energy","saturated_fat_g":"sat","total_sugars_g":"sugar","salt_g":"salt","protein_g":"protein","fibre_g":"fibre","free_sugars_g":"freeSugar","fvn_percent":"fvn","fvns_percent":"fvns","plant_points":"plantPoints","protein_energy_percent":"proteinEnergyPct"}
+    values={}
+    for source,target in number_fields.items():
+        text=cell(source)
+        if not text:
+            values[target]=None
+            continue
+        try: value=float(text)
+        except ValueError:
+            values[target]=None; warnings.append(f"{source}: not numeric ({text})"); continue
+        if value<0 or (target in {"fvn","fvns","proteinEnergyPct"} and value>100):
+            values[target]=None; warnings.append(f"{source}: outside the accepted range ({text})"); continue
+        values[target]=int(value) if target=="plantPoints" else value
+    x={**values,"salt":values["salt"],"sodium":values["salt"]*400 if values["salt"] is not None else None,"fibreMethod":fibre_method}
+    threshold_category=cell("hb_threshold_category")
+    if threshold_category not in HB_THRESHOLDS:
+        threshold_category=""
+    reviewer=cell("reviewer") or default_reviewer
+    inputs={"sku":sku,"name":name,"product_type":kind,"assessment_basis":basis,
+        "l1":cell("l1_category"),"l2":cell("l2_category"),"l3":cell("l3_category"),"l4":cell("l4_category"),
+        "ingredients":cell("ingredients"),"reviewer":reviewer,
+        "review_decision":cell("review_decision") or "Not reviewed","review_notes":cell("review_notes"),
+        "nutrition_source":cell("nutrition_source"),"specialist_source":cell("specialist_source"),
+        "addedSugarStatus":added,**x}
+    results=[score_model(model,x,kind) for model in NPM]
+    record={"timestamp":run_timestamp,"rulesetBuild":"2026-09-10 v0.1","runType":"bulk user calculation",
+        "inputs":inputs,"results":results,"inputWarnings":warnings,
+        "hbThresholdCheck":{"category":threshold_category,"rows":check_hb_thresholds(threshold_category,x,added) if threshold_category else []}}
+    filename=f"{safe_filename_part(sku,'SKU')} - {safe_filename_part(name,'Product')}.pdf"
+    return record,filename
 
 
 def check_hb_thresholds(category: str, x: dict, added_sugar: str) -> list[dict]:
@@ -149,6 +215,36 @@ def score_model(model, x, kind):
         arows.append({"Group":"C","Input":label,"Value":fmt(v),"Threshold applied":("≤ "+fmt(lim[0]) if p==0 else "> "+fmt(lim[p-1])),"Points":p,"Included":"Yes" if label!="Protein (g)" or protein_used else "No · protein gate"})
     C=fvp+fp+(pp if protein_used else 0); total=A-C; threshold=1 if kind=="Drink" else 4
     return {"model":model,"blocked":False,"A":A,"C":C,"score":total,"threshold":threshold,"classification":"Less healthy" if total>=threshold else "Not less healthy","protein_used":protein_used,"ledger":arows,"notes":"Salt converted to sodium (salt × 400)." if model=="2004/05" else "Comparison scenario uses verified free sugars and FVNS values."}
+
+
+def point_band_tables(model: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return scoring bands as implemented, for reviewer inspection."""
+    rule=NPM[model]
+    def cutoff_band(point: int, thresholds: list[float], unit: str) -> str:
+        if point==0: return f"≤ {fmt(thresholds[0])} {unit}"
+        if point<=len(thresholds): return f"> {fmt(thresholds[point-1])} {unit}"
+        return "Not applicable"
+    a_rows=[]
+    for point in range(11):
+        row={"Points":point}
+        for label,key,thresholds in rule["a"]:
+            unit="kJ" if key=="energy" else "mg sodium" if key=="sodium" else "g"
+            row[label]=cutoff_band(point,thresholds,unit)
+        a_rows.append(row)
+    fv_bands={0:"≤ 40%",1:"> 40% to ≤ 60%",2:"> 60% to ≤ 80%",3:"Not applicable",4:"Not applicable",5:"> 80%"}
+    c_rows=[]
+    for point in range(11):
+        if model=="2004/05":
+            row={"Points":point,"FVN (%)":fv_bands.get(point,"Not applicable"),
+                 "Fibre · NSP (g)":cutoff_band(point,rule["fibre"]["NSP / Englyst"],"g"),
+                 "Fibre · AOAC (g)":cutoff_band(point,rule["fibre"]["AOAC"],"g"),
+                 "Protein (g)":cutoff_band(point,rule["protein"],"g")}
+        else:
+            row={"Points":point,"FVNS (%)":fv_bands.get(point,"Not applicable"),
+                 "Fibre · AOAC (g)":cutoff_band(point,rule["fibre"]["AOAC"],"g"),
+                 "Protein (g)":cutoff_band(point,rule["protein"],"g")}
+        c_rows.append(row)
+    return pd.DataFrame(a_rows),pd.DataFrame(c_rows)
 
 
 def build_assessment_pdf(record: dict) -> bytes:
@@ -196,7 +292,8 @@ def build_assessment_pdf(record: dict) -> bytes:
         [para("DATE RUN","MetaLabel"),para(run_at),para("USER / REVIEWER","MetaLabel"),para(inp.get("reviewer"))],
         [para("PRODUCT ID","MetaLabel"),para(inp.get("sku")),para("PRODUCT NAME","MetaLabel"),para(inp.get("name"))],
         [para("PRODUCT TYPE","MetaLabel"),para(inp.get("product_type")),para("ASSESSMENT BASIS","MetaLabel"),para(inp.get("assessment_basis"))],
-        [para("REVIEW DECISION","MetaLabel"),para(inp.get("review_decision")),para("RULESET","MetaLabel"),para(record.get("rulesetBuild"))],
+        [para("REVIEW DECISION","MetaLabel"),para(inp.get("review_decision")),para("RUN TYPE","MetaLabel"),para(record.get("runType"))],
+        [para("RULESET","MetaLabel"),para(record.get("rulesetBuild")),para("FIBRE METHOD","MetaLabel"),para(inp.get("fibreMethod"))],
     ]
     meta_table=Table(meta,colWidths=[25*mm,58*mm,29*mm,58*mm],hAlign="LEFT")
     meta_table.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),pale),("BOX",(0,0),(-1,-1),.6,line),("INNERGRID",(0,0),(-1,-1),.35,line),("VALIGN",(0,0),(-1,-1),"TOP"),("LEFTPADDING",(0,0),(-1,-1),6),("RIGHTPADDING",(0,0),(-1,-1),6),("TOPPADDING",(0,0),(-1,-1),6),("BOTTOMPADDING",(0,0),(-1,-1),6)]))
@@ -218,6 +315,25 @@ def build_assessment_pdf(record: dict) -> bytes:
         story.extend([Spacer(1,5),para("Review note: "+inp["review_notes"],"BodySmall")])
     if inp.get("ingredients"):
         story.extend([Paragraph("Ingredient declaration",styles["Section"]),para(inp["ingredients"],"BodySmall")])
+    story.append(Paragraph("H&B internal threshold comparison",styles["Section"]))
+    hb=record.get("hbThresholdCheck") or {}
+    if not hb.get("category"):
+        story.append(para("No H&B threshold category was selected; compliance was not assessed.","BodySmall"))
+    else:
+        story.append(para(f"Selected reference category: {hb['category']}. Status compares entered values with the threshold transcription; it is not a governed compliance decision.","MutedSmall"))
+        hb_rows=hb.get("rows",[])
+        if hb_rows:
+            table_rows=[[para(x,"TableHead") for x in ["NUTRIENT / CRITERION","ENTERED VALUE","THRESHOLD","STATUS"]]]
+            for item in hb_rows:
+                table_rows.append([para(item.get("Nutrient / criterion")),para(item.get("Entered value")),para(item.get("Threshold")),para(item.get("Status"))])
+            story.append(grid(table_rows,[48*mm,45*mm,40*mm,32*mm]))
+        else:
+            story.append(para("Threshold category could not be evaluated.","BodySmall"))
+        story.append(para("Confirm category mapping, units and limits against the current controlled H&B policy before using this comparison.","MutedSmall"))
+    warnings=record.get("inputWarnings",[])
+    if warnings:
+        story.append(Paragraph("Bulk input warnings",styles["Section"]))
+        for warning in warnings: story.append(para("- "+warning,"BodySmall"))
     story.append(Paragraph("Calculation detail",styles["Section"]))
     for res in results:
         block=[Paragraph(NPM[res["model"]]["label"],styles["BodySmall"])]
@@ -231,6 +347,8 @@ def build_assessment_pdf(record: dict) -> bytes:
             block.append(para(f"A {res['A']} - C {res['C']} = {res['score']}. {res['notes']}","MutedSmall"))
         story.extend([KeepTogether(block),Spacer(1,6)])
     story.extend([Spacer(1,8),para("This report records entered data and deterministic calculations. It is a working aid and does not replace regulatory review, evidence verification or product sign-off.","MutedSmall")])
+    story.append(Paragraph("Method references",styles["Section"]))
+    story.append(Paragraph('NPM 2004/05: <link href="https://assets.publishing.service.gov.uk/media/695e87982a4a53b73d513855/NutrientProfilingModel_2004_2005_TechnicalGuidance.pdf" color="#174B3B">Department of Health technical guidance (2011)</link><br/>NPM 2018: <link href="https://www.gov.uk/government/publications/nutrient-profiling-model-2018/nutrient-profiling-model-2018-technical-guidance" color="#174B3B">DHSC technical guidance</link>. The NPM 2018 publication page states this model is not yet applied to policy.',styles["MutedSmall"]))
     def footer(canvas,document):
         canvas.saveState(); w,h=A4
         canvas.setStrokeColor(line); canvas.line(17*mm,13*mm,w-17*mm,13*mm)
@@ -251,7 +369,7 @@ with st.sidebar:
     st.markdown("---")
     st.caption("Reference values only. Reconstituted products should use values after preparation as directed.")
 
-assessment, scope, policy, guide = st.tabs(["✦  Product assessment","✧  Category estimate","❋  H&B thresholds","♡  Guide & controls"])
+assessment, bulk, scope, policy, audit, guide = st.tabs(["✦  Product assessment","Bulk upload","✧  Category estimate","❋  H&B thresholds","Calculation logic & audit","Guide & controls"])
 with assessment:
     st.markdown("## A clearer picture of your product")
     st.markdown('<div class="muted">Use verified supplier or laboratory data. Specialist values should come from an approved source.</div>',unsafe_allow_html=True)
@@ -292,14 +410,21 @@ with assessment:
             calc=st.button("Calculate both NPM models",type="primary",use_container_width=True)
             example=st.button("Load worked 2004/05 example")
     x={"energy":energy,"sat":sat,"sugar":sugar,"salt":salt,"sodium":salt*400 if salt is not None else None,"protein":protein,"fibre":fibre,"freeSugar":free_sugar,"fvn":fvn,"fvns":fvns,"fibreMethod":fibre_method,"plantPoints":plant,"proteinEnergyPct":protein_pct}
+    current_inputs={"sku":sku,"name":name,"product_type":kind,"assessment_basis":basis,"l1":l1,"l2":l2,"l3":l3,"l4":l4,"ingredients":ingredients,"reviewer":reviewer,"review_decision":decision,"review_notes":review_notes,"nutrition_source":nutrition_source,"specialist_source":specialist_source,"addedSugarStatus":added,**x}
     if example:
-        x.update(dict(energy=459,sat=1.8,sugar=13.4,salt=.00025,sodium=.1,protein=6.5,fibre=.6,fvn=8,fvns=None,freeSugar=None,fibreMethod="AOAC"))
-        st.session_state["demo_result"]=[score_model(m,x,"Food") for m in NPM]
-    if calc: st.session_state["assessment_result"]=[score_model(m,x,kind) for m in NPM]
+        example_x={**x,"energy":459,"sat":1.8,"sugar":13.4,"salt":.00025,"sodium":.1,"protein":6.5,"fibre":.6,"fvn":8,"fvns":None,"freeSugar":None,"fibreMethod":"AOAC"}
+        example_inputs={**current_inputs,"sku":"EX-2004-001","name":"Official example: fruit fromage frais","product_type":"Food","nutrition_source":"NPM 2004/05 technical guidance, worked example 1","specialist_source":"NPM 2004/05 technical guidance, worked example 1",**example_x}
+        st.session_state["assessment_run"]={"timestamp":datetime.now(timezone.utc).isoformat(),"inputs":example_inputs,"results":[score_model(m,example_x,"Food") for m in NPM],"source":"official worked example"}
+    if calc:
+        st.session_state["assessment_run"]={"timestamp":datetime.now(timezone.utc).isoformat(),"inputs":current_inputs,"results":[score_model(m,x,kind) for m in NPM],"source":"user calculation"}
     with right:
         st.markdown("### Your NPM results")
         st.caption("Both models run together. NPM 2018 remains a comparison scenario until its business application is confirmed.")
-        results=st.session_state.get("assessment_result") or st.session_state.get("demo_result")
+        run=st.session_state.get("assessment_run")
+        results=run["results"] if run else None
+        input_changed=bool(run and run["source"]=="user calculation" and run["inputs"]!=current_inputs)
+        if input_changed:
+            st.warning("Inputs have changed since this result was calculated. Recalculate before exporting an evidence record.")
         if not results:
             st.markdown('<div class="leaf-note">Your results will appear here once you have entered the verified product data and selected <b>Calculate both NPM models</b>.</div>',unsafe_allow_html=True)
         else:
@@ -336,13 +461,116 @@ with assessment:
                 st.dataframe(pd.DataFrame(saved_hb["rows"]),hide_index=True,use_container_width=True)
                 st.caption("Reference comparison only; confirm thresholds against the current controlled H&B policy before making a product decision.")
         if results:
-            record={"timestamp":datetime.now(timezone.utc).isoformat(),"rulesetBuild":"2026-09-10 v0.1","inputs":{"sku":sku,"name":name,"product_type":kind,"assessment_basis":basis,"l1":l1,"l2":l2,"l3":l3,"l4":l4,"ingredients":ingredients,"reviewer":reviewer,"review_decision":decision,"review_notes":review_notes,"nutrition_source":nutrition_source,"specialist_source":specialist_source,**x},"results":results}
-            safe_sku=re.sub(r'[^a-zA-Z0-9_-]','-',sku or 'draft')
+            run_inputs=run["inputs"]
+            record={"timestamp":run["timestamp"],"rulesetBuild":"2026-09-10 v0.1","runType":run["source"],"inputs":run_inputs,"results":results,
+                    "hbThresholdCheck":{"category":hb_category,"rows":check_hb_thresholds(hb_category,run_inputs,run_inputs.get("addedSugarStatus","Unknown — review needed"))},"inputWarnings":[]}
+            safe_sku=re.sub(r'[^a-zA-Z0-9_-]','-',run["inputs"].get("sku") or 'draft')
             json_col,pdf_col=st.columns(2)
             with json_col:
-                st.download_button("Download assessment record · JSON",json.dumps(record,indent=2),file_name=f"nutrition-assessment-{safe_sku}.json",mime="application/json",use_container_width=True)
+                st.download_button("Download assessment record · JSON",json.dumps(record,indent=2),file_name=f"nutrition-assessment-{safe_sku}.json",mime="application/json",use_container_width=True,disabled=input_changed)
             with pdf_col:
-                st.download_button("Download assessment report · PDF",build_assessment_pdf(record),file_name=f"nutrition-assessment-{safe_sku}.pdf",mime="application/pdf",use_container_width=True)
+                try:
+                    pdf_bytes=build_assessment_pdf(record)
+                except ModuleNotFoundError as exc:
+                    if exc.name and exc.name.startswith("reportlab"):
+                        st.warning("PDF export needs reportlab. Add reportlab = \"*\" to pyproject.toml and redeploy.")
+                    else:
+                        raise
+                else:
+                    st.download_button("Download assessment report · PDF",pdf_bytes,file_name=f"nutrition-assessment-{safe_sku}.pdf",mime="application/pdf",use_container_width=True,disabled=input_changed)
+
+with bulk:
+    st.markdown("## Bulk assessment")
+    st.caption("Upload up to 10 products. The tool calculates both NPM models and creates one PDF per SKU.")
+    template = pd.DataFrame(columns=BULK_TEMPLATE_COLUMNS).to_csv(index=False).encode("utf-8")
+    st.download_button("Download CSV template",template,file_name="npm_bulk_input_template.csv",mime="text/csv",key="bulk_template_download")
+    st.markdown("Fill one row per SKU. Enter nutrient values per 100 g or 100 ml. Use `Food` or `Drink` for product_type. The H&B threshold category must match a category listed in the H&B thresholds tab. Leave unknown numeric values blank; the report will show when a model cannot be calculated.")
+    with st.expander("Valid H&B threshold categories"):
+        st.write(", ".join(HB_THRESHOLDS.keys()))
+    bulk_reviewer=st.text_input("Default user / reviewer",key="bulk_default_reviewer")
+    if st.session_state.get("bulk_pdf_outputs") and st.session_state.get("bulk_reviewer_for_outputs")!=bulk_reviewer:
+        st.session_state.pop("bulk_pdf_outputs",None)
+    bulk_file=st.file_uploader("Upload completed template",type=["csv"],key="bulk_csv_upload")
+    bulk_source_hash=None
+    bulk_df=None
+    bulk_errors=[]
+    if bulk_file is not None:
+        bulk_bytes=bulk_file.getvalue()
+        bulk_source_hash=hashlib.sha256(bulk_bytes).hexdigest()
+        if st.session_state.get("bulk_source_hash") not in (None,bulk_source_hash):
+            st.session_state.pop("bulk_pdf_outputs",None)
+        try:
+            bulk_df=pd.read_csv(BytesIO(bulk_bytes),dtype=str,keep_default_na=False)
+            bulk_df.columns=[str(col).strip().lower() for col in bulk_df.columns]
+            if bulk_df.columns.duplicated().any():
+                bulk_errors.append("The CSV has duplicate column names after trimming spaces and converting to lowercase.")
+            missing_headers=sorted(set(BULK_TEMPLATE_COLUMNS[:3]+["hb_threshold_category"])-set(bulk_df.columns))
+            if missing_headers:
+                bulk_errors.append("Missing required columns: "+", ".join(missing_headers))
+            if len(bulk_df)>10:
+                bulk_errors.append(f"The file has {len(bulk_df)} product rows. Upload no more than 10 at a time.")
+            if len(bulk_df)==0:
+                bulk_errors.append("The CSV has no product rows.")
+            if not bulk_errors:
+                for row_index,row in bulk_df.iterrows():
+                    row_num=row_index+2
+                    sku_value=str(row.get("sku_id","")).strip()
+                    name_value=str(row.get("sku_name","")).strip()
+                    kind_value=str(row.get("product_type","")).strip().casefold()
+                    category_value=str(row.get("hb_threshold_category","")).strip()
+                    if not sku_value: bulk_errors.append(f"Row {row_num}: SKU ID is required.")
+                    if not name_value: bulk_errors.append(f"Row {row_num}: SKU name is required.")
+                    if kind_value not in {"food","drink","beverage"}:
+                        bulk_errors.append(f"Row {row_num}: product_type must be Food or Drink.")
+                    category_key=next((category for category in HB_THRESHOLDS if category.casefold()==category_value.casefold()),None)
+                    if not category_key:
+                        bulk_errors.append(f"Row {row_num}: choose an H&B threshold category from the valid category list.")
+                    else:
+                        bulk_df.at[row_index,"hb_threshold_category"]=category_key
+                if "sku_id" in bulk_df:
+                    sku_values=bulk_df["sku_id"].astype(str).str.strip()
+                    duplicated=sku_values[sku_values.ne("") & sku_values.duplicated(keep=False)]
+                    if not duplicated.empty:
+                        bulk_errors.append("SKU IDs must be unique within the file: "+", ".join(sorted(set(duplicated.tolist()))))
+            st.dataframe(bulk_df.head(10),hide_index=True,use_container_width=True)
+        except Exception as exc:
+            bulk_errors.append(f"Could not read the CSV: {exc}")
+        if bulk_errors:
+            for message in bulk_errors: st.error(message)
+        else:
+            st.success(f"{len(bulk_df)} SKU row(s) ready.")
+            if st.button("Calculate both NPM models and create PDFs",type="primary",key="run_bulk_assessment"):
+                generated=[]
+                timestamp=datetime.now(timezone.utc).isoformat()
+                try:
+                    for index,row in bulk_df.iterrows():
+                        record,filename=bulk_row_to_record(row.to_dict(),index,timestamp,bulk_reviewer)
+                        pdf_bytes=build_assessment_pdf(record)
+                        generated.append({"record":record,"filename":filename,"pdf":pdf_bytes})
+                except ModuleNotFoundError as exc:
+                    if exc.name and exc.name.startswith("reportlab"):
+                        st.error('PDF export needs reportlab. Add "reportlab" to the dependencies in pyproject.toml and redeploy.')
+                    else:
+                        raise
+                else:
+                    st.session_state["bulk_pdf_outputs"]=generated
+                    st.session_state["bulk_source_hash"]=bulk_source_hash
+                    st.session_state["bulk_reviewer_for_outputs"]=bulk_reviewer
+    outputs=st.session_state.get("bulk_pdf_outputs",[])
+    if outputs and bulk_source_hash==st.session_state.get("bulk_source_hash"):
+        st.markdown("### Reports")
+        zip_buffer=BytesIO()
+        with ZipFile(zip_buffer,"w",compression=ZIP_DEFLATED) as archive:
+            for output in outputs:
+                archive.writestr(output["filename"],output["pdf"])
+        st.download_button("Download all PDFs · ZIP",zip_buffer.getvalue(),file_name="nutrition-bulk-assessments.zip",mime="application/zip",key="bulk_zip_download")
+        for index,output in enumerate(outputs):
+            record=output["record"]
+            input_data=record["inputs"]
+            results=record["results"]
+            statuses=[f"{NPM[result['model']]['id']}: {('blocked' if result['blocked'] else result['classification'])}" for result in results]
+            st.download_button(f"Download {output['filename']}",output["pdf"],file_name=output["filename"],mime="application/pdf",key=f"bulk_pdf_{index}")
+            st.caption(f"{input_data['sku']} · {input_data['name']} — {'; '.join(statuses)}")
 
 with scope:
     st.markdown("## A considered category estimate")
@@ -387,6 +615,59 @@ with policy:
     aspirational={"Breakfast cereals":"Protein energy ≥12%; fibre ≥6 g; plant points ≥5","Cakes":"Fibre >6 g; plant points >4","Chips":"Fibre >6 g; plant points >1","Chocolate":"Fibre ≥10 g; plant points ≥2","Cookies":"Fibre ≥6 g; protein ≥8 g; plant points ≥5","Grain, muesli, fruit and energy bars":"Fibre ≥6 g; protein ≥8 g; plant points ≥5","Nut-based spreads":"Fibre ≥6 g; protein ≥10 g; plant points ≥3","Protein bar":"Protein ≥20 g; fibre ≥8 g; plant points ≥4","Soft drinks, energy drinks and prepared syrups":"Plant points ≥1","Soups":"Fibre ≥3 g; protein ≥3 g; plant points ≥5","Sweet spreads":"Fibre ≥6 g; protein ≥10 g; plant points ≥5","Warm tomato / vegetable sauces":"Plant points ≥3","Brown bread":"Fibre >10 g; plant points >5","Salted nuts and seeds":"Plant points ≥5","Other savoury spreads":"Fibre ≥6 g; plant points ≥3","Other savoury snacks":"Plant points ≥3"}
     st.markdown("### Current nutrition thresholds · reference"); st.dataframe(pd.DataFrame([{"Product family":k,"Thresholds per 100":v} for k,v in global_policy.items()]),hide_index=True,use_container_width=True)
     st.markdown("### Own-brand aspirational criteria · reference"); st.dataframe(pd.DataFrame([{"Product family":k,"Criteria per 100":v} for k,v in aspirational.items()]),hide_index=True,use_container_width=True)
+
+with audit:
+    st.markdown("## Calculation logic & audit")
+    st.markdown("The calculation is deterministic. The same entered values and rules produce the same score. This page exposes the rules encoded in this app and the trace from the last calculation.")
+    st.markdown("**Scoring sequence**")
+    st.markdown("1. Score each A nutrient against its point cut-offs and add the points.\n2. Score each C component and check the protein gate.\n3. Calculate `final score = total A points - eligible C points`.\n4. Compare the score with the selected product-type threshold: food ≥ 4; drink ≥ 1.")
+    st.markdown("The app counts a point when a value is **strictly greater than** a cut-off. A value exactly on a cut-off does not pass it. The 2004/05 model derives sodium as entered salt × 400. For NPM 2018, the app requires AOAC fibre and uses entered free sugars and FVNS; it does not derive these from ingredients.")
+    st.markdown("### Point bands encoded in the app")
+    for model_key in ("2004/05","2018"):
+        a_table,c_table=point_band_tables(model_key)
+        with st.expander(f"{NPM[model_key]['label']} · show all point bands",expanded=(model_key=="2004/05")):
+            st.markdown("**A points**")
+            st.dataframe(a_table,hide_index=True,use_container_width=True)
+            st.markdown("**C points**")
+            st.dataframe(c_table,hide_index=True,use_container_width=True)
+    st.caption("The band tables above are generated from the threshold arrays in `app.py`. `Not applicable` marks point levels that the model does not award for that component.")
+    st.markdown("### Last calculation trace")
+    audit_run=st.session_state.get("assessment_run")
+    if not audit_run:
+        st.info("Run a calculation on Product assessment to populate the case-specific trace.")
+    else:
+        try: run_display=datetime.fromisoformat(audit_run["timestamp"]).astimezone().strftime("%d %b %Y, %H:%M %Z")
+        except (ValueError,TypeError): run_display=audit_run["timestamp"]
+        ai=audit_run["inputs"]
+        st.caption(f"Run: {run_display} · Product ID: {ai.get('sku') or 'Not provided'} · Product: {ai.get('name') or 'Not provided'} · Type: {ai.get('product_type')} · Basis: {ai.get('assessment_basis')} · Ruleset: 2026-09-10 v0.1 · {audit_run['source']}")
+        with st.expander("Inputs used for this run",expanded=True):
+            input_rows=[("Energy",ai.get("energy"),"kJ / 100"),("Saturated fat",ai.get("sat"),"g / 100"),("Total sugars",ai.get("sugar"),"g / 100"),("Free sugars",ai.get("freeSugar"),"g / 100"),("Salt",ai.get("salt"),"g / 100"),("Derived sodium",ai.get("sodium"),"mg / 100"),("Protein",ai.get("protein"),"g / 100"),("Fibre",ai.get("fibre"),f"g / 100 · {ai.get('fibreMethod')}"),("FVN",ai.get("fvn"),"%"),("FVNS",ai.get("fvns"),"%"),("Nutrition source",ai.get("nutrition_source"),""),("Specialist data source",ai.get("specialist_source"),"")]
+            st.dataframe(pd.DataFrame([{"Input":label,"Value":"Not entered" if val is None else val,"Unit / note":unit} for label,val,unit in input_rows]),hide_index=True,use_container_width=True)
+        for result in audit_run["results"]:
+            with st.expander(f"{NPM[result['model']]['label']} · {'Blocked' if result['blocked'] else result['classification']}",expanded=True):
+                if result["blocked"]:
+                    st.error("No score produced. Missing or invalid: " + ", ".join(result["missing"]))
+                else:
+                    a_rows=[row for row in result["ledger"] if row["Group"]=="A"]
+                    c_rows=[row for row in result["ledger"] if row["Group"]=="C"]
+                    fv_row=next(row for row in c_rows if row["Input"].startswith("FVN"))
+                    fibre_row=next(row for row in c_rows if row["Input"].startswith("Fibre"))
+                    protein_row=next(row for row in c_rows if row["Input"]=="Protein")
+                    st.markdown(f"**Step 1 - A points:** {' + '.join(str(row['Points']) for row in a_rows)} = **{result['A']}**")
+                    st.dataframe(pd.DataFrame(a_rows),hide_index=True,use_container_width=True)
+                    st.markdown(f"**Step 2 - C points:** FVN/FVNS {fv_row['Points']} + fibre {fibre_row['Points']} + protein {protein_row['Points'] if result['protein_used'] else 0} = **{result['C']}**")
+                    if result["A"]>=11 and fv_row["Points"]<5:
+                        st.caption(f"Protein gate: A = {result['A']} (≥ 11) and {fv_row['Input']} points = {fv_row['Points']} (< 5), so protein points are excluded.")
+                    else:
+                        st.caption(f"Protein gate: {'protein points are included' if result['protein_used'] else 'protein points are excluded'} for this case.")
+                    st.dataframe(pd.DataFrame(c_rows),hide_index=True,use_container_width=True)
+                    operator="≥" if result["classification"]=="Less healthy" else "<"
+                    st.markdown(f"**Step 3 - Final score:** A {result['A']} − C {result['C']} = **{result['score']}**.")
+                    st.markdown(f"**Step 4 - Classification:** {result['score']} {operator} {result['threshold']} {('drink' if ai.get('product_type')=='Drink' else 'food')} threshold → **{result['classification']}**.")
+                    st.caption(result["notes"])
+    st.markdown("### Method references")
+    st.markdown("- [NPM 2004/05 technical guidance (Department of Health, 2011)](https://assets.publishing.service.gov.uk/media/695e87982a4a53b73d513855/NutrientProfilingModel_2004_2005_TechnicalGuidance.pdf)\n- [NPM 2018 technical guidance (Department of Health and Social Care)](https://www.gov.uk/government/publications/nutrient-profiling-model-2018/nutrient-profiling-model-2018-technical-guidance)\n- [NPM 2018 publication status](https://www.gov.uk/government/publications/nutrient-profiling-model-2018): the published guidance describes NPM 2018 as a reference model not yet applied to policy.")
+    st.warning("This audit view shows what this app calculated from the supplied inputs. It is not an independent validation of source data or regulatory interpretation. Have the formula tables, category decisions and evidence requirements reviewed against the current controlled guidance before relying on a result.")
 
 with guide:
     st.markdown("## A little guidance before you begin")
