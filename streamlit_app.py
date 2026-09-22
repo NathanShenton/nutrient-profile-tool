@@ -66,7 +66,7 @@ div.stButton>button:hover,div.stDownloadButton>button:hover { background:#28644d
 
 st.markdown("""
 <div class="hero"><div class="eyebrow">Nutrition Assessment</div>
-<h1>Nutrition Product Tool</h1>
+<h1>Nutrient Profile Tool</h1>
 <p>Calculate NPM scores, review the inputs and record product evidence.</p></div>
 """, unsafe_allow_html=True)
 
