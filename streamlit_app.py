@@ -747,7 +747,7 @@ with guide:
     st.markdown("### Ingredient review prompts")
     st.caption("A lightweight keyword prompt only. It does not determine compliance or replace the controlled additive policy.")
     st.dataframe(pd.DataFrame([{"Review area":label,"Terms scanned":", ".join(terms)} for label,terms in INGREDIENT_REVIEW_PROMPTS]),hide_index=True,use_container_width=True)
-    st.caption("The scan is case-insensitive. BHA and BHT are matched as whole words. To change what it checks, edit `INGREDIENT_REVIEW_PROMPTS` in app.py; the table, single and bulk runs use the same list.")
+    st.caption("The scan is case-insensitive. BHA and BHT are matched as whole words. This list we can tweak in the codebase if needed")
     ingredient_text=st.text_area("Ingredient declaration to review",value=ingredients,key="ingredient_screen",height=110)
     if st.button("Scan for review prompts"):
         matches=scan_ingredient_review(ingredient_text)
